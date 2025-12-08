@@ -1,0 +1,47 @@
+# Requires Python 3.9+ (for zoneinfo support used in multi-day summary functionality)
+
+# ============================================================================
+# CORE DEPENDENCIES (Required for fyers_detector.py and health.py)
+# ============================================================================
+
+# HTTP requests and environment management
+requests>=2.31.0
+pyotp>=2.9.0
+python-dotenv>=1.0.0
+
+# Fyers API integration
+fyers-apiv3>=2.0.9
+
+# Google Sheets integration
+gspread>=5.12.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+
+# WebSocket for real-time market data
+websocket-client>=1.6.0
+
+# FastAPI for health monitoring server
+fastapi>=0.100.0
+uvicorn>=0.23.0
+
+# ============================================================================
+# OPTIONAL DEPENDENCIES (for additional features)
+# ============================================================================
+
+# Excel file handling (for extract.py - Telegram message extraction)
+openpyxl>=3.1.0
+
+# Selenium for automated authentication (used in test.py)
+selenium>=4.0.0
+
+# ============================================================================
+# NOTES
+# ============================================================================
+# The following packages were removed as they are NOT used in the current code:
+# - flask>=2.3.0 (replaced by FastAPI)
+# - pandas>=2.0.0 (not used in main functionality)  
+# - numpy>=1.24.0 (not used in main functionality)
+# - schedule>=1.2.0 (custom scheduling implemented instead)
+# - python-telegram-bot>=20.0 (direct HTTP requests used instead)
+# - nest-asyncio>=1.5.6 (not needed for current FastAPI setup)
