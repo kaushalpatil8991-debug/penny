@@ -45,7 +45,7 @@ max_restarts = 5
 last_restart_time = 0
 
 # Health ping configuration
-HEALTH_PING_URL = "https://penny-00h7.onrender.com/health"
+HEALTH_PING_URL = "https://fyers-volume-spike-detector.onrender.com/health"
 HEALTH_PING_INTERVAL = 420  # 7 minutes in seconds
 last_health_ping_time = 0
 health_ping_success_count = 0
@@ -99,12 +99,18 @@ def initialize_summary_components():
             
             # Import after environment is loaded and path is set
             try:
-                from summary import DailySummaryGenerator, SummaryTelegramHandler
-                print("Successfully imported fyers classes")
+                # Try importing from summary.py first, then fall back to fyers.py
+                try:
+                    from summary import DailySummaryGenerator, SummaryTelegramHandler
+                    print("Successfully imported from summary module")
+                except ImportError:
+                    from fyers import DailySummaryGenerator, SummaryTelegramHandler
+                    print("Successfully imported from fyers module")
             except ImportError as import_error:
-                print(f"Import error for fyers: {import_error}")
+                print(f"Import error: {import_error}")
                 print(f"Current working directory: {os.getcwd()}")
                 print(f"Python path includes: {sys.path[:3]}...")  # Show first 3 entries
+                print(f"Available Python files: {[f for f in os.listdir(current_dir) if f.endswith('.py')]}")
                 return False
             
             # Create instances
@@ -430,8 +436,12 @@ async def debug_import():
                 if location not in sys.path:
                     sys.path.insert(0, location)
                 
-                if os.path.exists(os.path.join(location, "fyers.py")):
-                    from summary import DailySummaryGenerator, SummaryTelegramHandler
+                # Check for either summary.py or fyers.py
+                if os.path.exists(os.path.join(location, "summary.py")) or os.path.exists(os.path.join(location, "fyers.py")):
+                    try:
+                        from summary import DailySummaryGenerator, SummaryTelegramHandler
+                    except ImportError:
+                        from fyers import DailySummaryGenerator, SummaryTelegramHandler
                     import_attempts.append({
                         "location": location,
                         "success": True,
@@ -818,5 +828,4 @@ if __name__ == "__main__":
     # Start health server
     port = int(os.getenv("PORT", 8000))
     print(f"Health server starting on port {port}")
-
     uvicorn.run(app, host="0.0.0.0", port=port)
