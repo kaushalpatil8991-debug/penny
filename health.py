@@ -45,7 +45,7 @@ max_restarts = 5
 last_restart_time = 0
 
 # Health ping configuration
-HEALTH_PING_URL = "https://fyers-volume-spike-detector.onrender.com/health"
+HEALTH_PING_URL = "https://penny-00h7.onrender.com/health"
 HEALTH_PING_INTERVAL = 420  # 7 minutes in seconds
 last_health_ping_time = 0
 health_ping_success_count = 0
@@ -818,4 +818,5 @@ if __name__ == "__main__":
     # Start health server
     port = int(os.getenv("PORT", 8000))
     print(f"Health server starting on port {port}")
+
     uvicorn.run(app, host="0.0.0.0", port=port)
