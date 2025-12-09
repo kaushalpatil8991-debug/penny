@@ -2173,10 +2173,19 @@ class VolumeSpikeDetector:
             self.fyers_ws.connect()
             print("[MONITOR] WebSocket connect() called - connection active")
 
+            # Heartbeat to show detector is alive
+            heartbeat_counter = 0
             while not self.stop_event.is_set():
                 if check_market_end():
                     print("[MONITOR] Market hours ended, stopping monitoring...")
                     break
+
+                # Print heartbeat every 60 seconds
+                heartbeat_counter += 1
+                if heartbeat_counter % 60 == 0:
+                    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+                    print(f"[HEARTBEAT] Detector alive at {now.strftime('%H:%M:%S')} - Messages: {self.message_count}")
+
                 time.sleep(1)
 
             print("[MONITOR] Closing WebSocket connection...")
