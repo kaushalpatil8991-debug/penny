@@ -2188,26 +2188,64 @@ class VolumeSpikeDetector:
 
 def start_all_services():
     """Start both the volume detector and summary scheduler"""
-    print("Starting all services...")
-    
-    summary_thread = threading.Thread(target=summary_scheduler, daemon=True)
-    summary_thread.start()
-    print("Summary scheduler started in background")
-    
-    supervisor_loop()
+    print("\n[SERVICES] Starting all services...")
 
-if __name__ == "__main__":
     try:
-        print("="*50)
-        print("Fyers Volume Spike Detector with Daily Summary")
-        print("="*50)
-        
-        start_all_services()
-        
-    except KeyboardInterrupt:
-        print("\nShutting down gracefully...")
-        _stop_stream_once()
+        print("[SERVICES] Creating summary scheduler thread...")
+        summary_thread = threading.Thread(target=summary_scheduler, daemon=True)
+        summary_thread.start()
+        print("[SERVICES] Summary scheduler started in background")
+
+        print("[SERVICES] Starting supervisor loop...")
+        supervisor_loop()
     except Exception as e:
-        print(f"\nFatal error: {e}")
+        print(f"[SERVICES] Error starting services: {e}")
         import traceback
         traceback.print_exc()
+        raise
+
+if __name__ == "__main__":
+    # Force unbuffered output for real-time logs on Render
+    sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+    sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, 'reconfigure') else None
+
+    try:
+        print("\n" + "="*60, flush=True)
+        print("FYERS VOLUME SPIKE DETECTOR - STARTUP", flush=True)
+        print("="*60, flush=True)
+        print(f"Python Version: {sys.version}", flush=True)
+        print(f"Current Directory: {os.getcwd()}", flush=True)
+        print(f"Script Path: {os.path.abspath(__file__)}", flush=True)
+        print(f"Platform: {sys.platform}", flush=True)
+
+        # Check critical environment variables
+        print("\n" + "="*60)
+        print("CHECKING ENVIRONMENT VARIABLES")
+        print("="*60)
+
+        env_checks = {
+            'GOOGLE_CREDENTIALS_JSON': os.getenv('GOOGLE_CREDENTIALS_JSON') is not None,
+            'GOOGLE_CLIENT_EMAIL': os.getenv('GOOGLE_CLIENT_EMAIL') is not None,
+            'FYERS_ACCESS_TOKEN': FYERS_ACCESS_TOKEN != '',
+            'TELEGRAM_BOT_TOKEN': TELEGRAM_BOT_TOKEN != '',
+            'GOOGLE_SHEETS_ID': GOOGLE_SHEETS_ID != ''
+        }
+
+        for key, status in env_checks.items():
+            status_str = "OK" if status else "MISSING"
+            print(f"  {key}: [{status_str}]")
+
+        print("\n" + "="*60)
+        print("STARTING SERVICES")
+        print("="*60)
+
+        start_all_services()
+
+    except KeyboardInterrupt:
+        print("\n[SHUTDOWN] Shutting down gracefully...")
+        _stop_stream_once()
+    except Exception as e:
+        print(f"\n[FATAL ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
