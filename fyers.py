@@ -2035,11 +2035,18 @@ class VolumeSpikeDetector:
             # FIXED: Handle the actual Fyers WebSocket data structure
             # Data comes at root level, not inside 'd' key
             if not isinstance(message, dict):
+                print(f"[DEBUG] Received non-dict message: {type(message)}")
                 return
+
+            # Show first 5 messages to understand structure
+            if self.message_count <= 5:
+                print(f"[DEBUG] Message #{self.message_count}: {message}")
 
             # Skip control messages (authentication, mode changes, etc.)
             msg_type = message.get('type', '')
             if msg_type in ['cn', 'ful', 'sub']:  # Control message types
+                if self.message_count <= 5:
+                    print(f"[DEBUG] Skipping control message type: {msg_type}")
                 return
 
             # Process symbol data messages (type 'sf' = symbol feed)
@@ -2103,31 +2110,34 @@ class VolumeSpikeDetector:
     
     def on_open(self):
         """Callback for WebSocket open"""
-        print("WebSocket connection opened")
+        print("\n" + "="*60)
+        print("[WEBSOCKET] Connection opened successfully!")
+        print("="*60)
 
         # FIXED: Changed from "symbolData" to "SymbolUpdate" to match Fyers API v3
         data_type = "SymbolUpdate"
         symbols = STOCK_SYMBOLS[:MAX_SYMBOLS]
 
-        print(f"\n[DEBUG] Subscription Details:")
-        print(f"[DEBUG] Data Type: {data_type}")
-        print(f"[DEBUG] Number of symbols: {len(symbols)}")
-        print(f"[DEBUG] First 5 symbols: {symbols[:5]}")
-        print(f"[DEBUG] Last 5 symbols: {symbols[-5:]}")
+        print(f"\n[WEBSOCKET] Subscription Details:")
+        print(f"  Data Type: {data_type}")
+        print(f"  Number of symbols: {len(symbols)}")
+        print(f"  First 5 symbols: {symbols[:5]}")
+        print(f"  Last 5 symbols: {symbols[-5:]}")
 
-        print(f"\nSubscribing to {len(symbols)} symbols...")
+        print(f"\n[WEBSOCKET] Subscribing to {len(symbols)} symbols...")
 
         try:
             self.fyers_ws.subscribe(symbols=symbols, data_type=data_type)
-            print("Subscription successful!")
+            print("[WEBSOCKET] Subscription successful!")
         except Exception as e:
-            print(f"[ERROR] Subscription failed: {e}")
+            print(f"[WEBSOCKET ERROR] Subscription failed: {e}")
             import traceback
             traceback.print_exc()
 
-        print(f"Monitoring {len(symbols)} stocks for volume spikes...")
-        print(f"Threshold: Rs{INDIVIDUAL_TRADE_THRESHOLD/10000000:.2f} Crores")
-        print(f"\n[DEBUG] Waiting for data messages with 'd' key...")
+        print(f"\n[WEBSOCKET] Now monitoring {len(symbols)} stocks for volume spikes")
+        print(f"[WEBSOCKET] Threshold: Rs{INDIVIDUAL_TRADE_THRESHOLD/10000000:.2f} Crores (Rs {INDIVIDUAL_TRADE_THRESHOLD:,})")
+        print(f"[WEBSOCKET] Waiting for market data messages...")
+        print("="*60 + "\n")
     
     def start_monitoring(self):
         """Start monitoring stocks"""
