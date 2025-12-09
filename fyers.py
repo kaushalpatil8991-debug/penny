@@ -93,26 +93,35 @@ def _stream_worker(stop_event: threading.Event):
     No retries - single attempt only for clean restart behavior
     """
     try:
-        print("Starting detector stream worker (single attempt)")
+        print("\n" + "="*60)
+        print("[WORKER] Starting detector stream worker (single attempt)")
+        print("="*60)
+
         detector = VolumeSpikeDetector()
         detector.stop_event = stop_event
-        
+
         # Initialize and run
-        if detector.initialize():
-            print("Detector initialized successfully")
+        print("[WORKER] Calling detector.initialize()...")
+        init_result = detector.initialize()
+        print(f"[WORKER] Initialize returned: {init_result}")
+
+        if init_result:
+            print("[WORKER] SUCCESS - Detector initialized successfully")
+            print("[WORKER] Calling detector.start_monitoring()...")
             detector.start_monitoring()
+            print("[WORKER] start_monitoring() returned - detector finished")
         else:
-            print("Detector initialization failed - exiting")
+            print("[WORKER] FAILED - Detector initialization failed - exiting")
             return
-            
+
     except Exception as e:
-        print(f"Stream worker error: {e}")
+        print(f"[WORKER] Stream worker error: {e}")
         import traceback
         traceback.print_exc()
-        print("Stream worker exiting due to error")
+        print("[WORKER] Stream worker exiting due to error")
         return
-    
-    print("Stream worker stopped")
+
+    print("[WORKER] Stream worker stopped normally")
 
 def _inside_window_ist() -> bool:
     """Check if current IST time is within market hours."""
@@ -124,34 +133,54 @@ def supervisor_loop():
     """
     Simplified supervisor that manages the detector lifecycle
     """
+    global _market_end_message_sent
+
     print("Supervisor loop started")
     detector = None
     last_auth_check = time.time()
     AUTH_CHECK_INTERVAL = 3600  # Check auth every hour
-    
+    last_market_check_date = None
+    outside_market_hours_logged = False
+
     while True:
         try:
             current_time = time.time()
-            
+
+            # Track date changes to reset flags
+            now = datetime.now(ZoneInfo("Asia/Kolkata"))
+            current_date = now.strftime("%Y-%m-%d")
+
+            if last_market_check_date != current_date:
+                # New day - reset flags
+                _market_end_message_sent = False
+                outside_market_hours_logged = False
+                last_market_check_date = current_date
+                print(f"New day detected: {current_date} - reset market hour flags")
+
             # Check if we're in market hours
             if SCHEDULING_ENABLED and not _inside_window_ist():
                 if detector:
-                    print("Outside market hours, stopping detector...")
+                    if not outside_market_hours_logged:
+                        print("Outside market hours, stopping detector...")
+                        outside_market_hours_logged = True
                     _stop_stream_once()
                     detector = None
                 time.sleep(60)
                 continue
-            
+
+            # We are in market hours - reset the flag
+            outside_market_hours_logged = False
+
             # We should be running - start detector if not running
             if not detector or not _running_flag:
                 print("Starting detector...")
                 _stop_stream_once()  # Clean stop if anything is running
                 time.sleep(2)
-                
+
                 # Create new detector instance
                 detector = VolumeSpikeDetector()
                 _start_stream_once()
-                
+
             # Periodic auth check (every hour)
             if current_time - last_auth_check > AUTH_CHECK_INTERVAL:
                 print("Performing periodic auth check...")
@@ -161,10 +190,10 @@ def supervisor_loop():
                         _stop_stream_once()
                         detector = None
                 last_auth_check = current_time
-            
+
             # Sleep before next check
             time.sleep(30)
-            
+
         except Exception as e:
             print(f"Supervisor error: {e}")
             import traceback
@@ -1765,19 +1794,23 @@ class FyersAuthenticator:
     def authenticate(self):
         """Perform fresh authentication"""
         try:
-            print("="*50)
-            print("Starting Fyers Authentication")
-            print("="*50)
-            
+            print("\n" + "="*60)
+            print("[AUTH] Starting Fyers Authentication")
+            print("="*60)
+
+            print("[AUTH] Validating existing token from JSON file...")
             is_valid, message = validate_fyers_token_from_json()
+            print(f"[AUTH] Token validation result: {is_valid} - {message}")
+
             if is_valid and FYERS_ACCESS_TOKEN:
-                print("Using existing valid token from JSON file")
+                print("[AUTH] SUCCESS - Using existing valid token from JSON file")
                 self.access_token = FYERS_ACCESS_TOKEN
                 self.is_authenticated = True
+                print("[AUTH] Authentication complete (using cached token)")
                 return True
-            
-            print("Performing fresh authentication...")
-            
+
+            print("[AUTH] Performing fresh authentication...")
+
             session = fyersModel.SessionModel(
                 client_id=self.client_id,
                 secret_key=self.secret_key,
@@ -1785,10 +1818,11 @@ class FyersAuthenticator:
                 response_type="code",
                 grant_type="authorization_code"
             )
-            
+
+            print("[AUTH] Generating authorization URL...")
             auth_url = session.generate_authcode()
-            print(f"\nAuthorization URL: {auth_url}\n")
-            
+            print(f"[AUTH] Authorization URL: {auth_url}\n")
+
             telegram_message = f"""<b>Fyers Authentication Required</b>
 
 Please click the link below to authorize:
@@ -1797,37 +1831,44 @@ Please click the link below to authorize:
 
 After authorizing, send the complete redirect URL here.
             """
-            
+
+            print("[AUTH] Sending authorization request to Telegram...")
             self.telegram_handler.send_message(telegram_message)
-            
+
+            print("[AUTH] Waiting for auth code from user...")
             auth_code = self.telegram_handler.wait_for_auth_code()
-            
+
             if not auth_code:
-                print("Failed to get auth code from Telegram")
+                print("[AUTH] FAILED - Failed to get auth code from Telegram")
                 return False
-            
+
+            print(f"[AUTH] SUCCESS - Auth code received: {auth_code[:20]}...")
+            print("[AUTH] Generating access token...")
+
             session.set_token(auth_code)
             response = session.generate_token()
-            
+
             if response and 'access_token' in response:
                 self.access_token = response['access_token']
                 self.is_authenticated = True
-                
+
+                print("[AUTH] Saving token to JSON file...")
                 save_fyers_token_to_json(self.access_token)
-                
-                print("Authentication successful!")
-                print(f"Access Token: {self.access_token[:20]}...")
-                
-                success_message = "<b>Fyers Authentication Successful!</b>\n\nYou can now start monitoring."
+
+                print("[AUTH] SUCCESS - Authentication successful!")
+                print(f"[AUTH] Access Token: {self.access_token[:20]}...")
+
+                success_message = "<b>Fyers Authentication Successful!</b>\n\nDetector will now start monitoring."
                 self.telegram_handler.send_message(success_message)
-                
+
+                print("[AUTH] Authentication complete - ready to initialize detector")
                 return True
             else:
-                print(f"Authentication failed: {response}")
+                print(f"[AUTH] FAILED - Authentication failed: {response}")
                 return False
-                
+
         except Exception as e:
-            print(f"Error during authentication: {e}")
+            print(f"[AUTH] ERROR - Error during authentication: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -1856,27 +1897,33 @@ class VolumeSpikeDetector:
     def initialize(self):
         """Initialize Fyers and Google Sheets connections"""
         try:
+            print("[INIT] Starting detector initialization...")
+            print("[INIT] Getting access token...")
             access_token = self.authenticator.get_access_token()
             if not access_token:
-                print("Failed to get access token")
+                print("[INIT] Failed to get access token")
                 return False
-            
+
+            print(f"[INIT] Access token received: {access_token[:20]}...")
+
             self.fyers = fyersModel.FyersModel(
                 client_id=self.authenticator.client_id,
                 token=access_token,
                 log_path=""
             )
-            
-            print("Fyers client initialized")
-            
+
+            print("[INIT] Fyers client initialized successfully")
+
+            print("[INIT] Initializing Google Sheets...")
             if not self.initialize_sheets():
-                print("Failed to initialize Google Sheets")
+                print("[INIT] Failed to initialize Google Sheets")
                 return False
-            
+
+            print("[INIT] SUCCESS - All initialization complete - ready to start monitoring")
             return True
-            
+
         except Exception as e:
-            print(f"Error during initialization: {e}")
+            print(f"[INIT] Error during initialization: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -1936,7 +1983,9 @@ class VolumeSpikeDetector:
 
             print(f"[DEBUG] Preparing to append row: {row}")
 
-            self.worksheet.append_row(row)
+            # Use append_row with value_input_option to ensure proper formatting
+            # and table_range to ensure it appends to column A onwards
+            self.worksheet.append_row(row, value_input_option='USER_ENTERED', table_range='A1')
 
             print(f"[SUCCESS] Added to Google Sheets: {data['symbol']} - Rs{data['value_crores']:.2f} Cr")
             return True
@@ -2083,15 +2132,21 @@ class VolumeSpikeDetector:
     def start_monitoring(self):
         """Start monitoring stocks"""
         try:
+            print("\n" + "="*60)
+            print("[MONITOR] start_monitoring() called - detector starting!")
+            print("="*60)
+
             wait_for_market_start()
-            
-            print("\nStarting Volume Spike Detector...")
-            print(f"Market Hours: {MARKET_START_TIME} - {MARKET_END_TIME}")
-            print(f"Individual Trade Threshold: Rs{INDIVIDUAL_TRADE_THRESHOLD/10000000:.2f} Crores")
-            print(f"Monitoring {MAX_SYMBOLS} symbols")
-            
+
+            print("\n[MONITOR] Starting Volume Spike Detector...")
+            print(f"[MONITOR] Market Hours: {MARKET_START_TIME} - {MARKET_END_TIME}")
+            print(f"[MONITOR] Individual Trade Threshold: Rs{INDIVIDUAL_TRADE_THRESHOLD/10000000:.2f} Crores")
+            print(f"[MONITOR] Monitoring {MAX_SYMBOLS} symbols")
+
             access_token = f"{self.authenticator.client_id}:{self.authenticator.access_token}"
-            
+            print(f"[MONITOR] Using access token: {access_token[:30]}...")
+
+            print("[MONITOR] Creating WebSocket connection...")
             self.fyers_ws = data_ws.FyersDataSocket(
                 access_token=access_token,
                 log_path="",
@@ -2103,25 +2158,27 @@ class VolumeSpikeDetector:
                 on_error=self.on_error,
                 on_message=self.on_message
             )
-            
+
+            print("[MONITOR] Connecting to WebSocket...")
             self.fyers_ws.connect()
-            
+            print("[MONITOR] WebSocket connect() called - connection active")
+
             while not self.stop_event.is_set():
                 if check_market_end():
-                    print("Market hours ended, stopping monitoring...")
+                    print("[MONITOR] Market hours ended, stopping monitoring...")
                     break
                 time.sleep(1)
-            
-            print("Closing WebSocket connection...")
+
+            print("[MONITOR] Closing WebSocket connection...")
             if self.fyers_ws:
                 try:
                     self.fyers_ws.close()
-                    print("WebSocket connection closed successfully")
+                    print("[MONITOR] WebSocket connection closed successfully")
                 except Exception as e:
-                    print(f"Error closing WebSocket: {e}")
-            
+                    print(f"[MONITOR] Error closing WebSocket: {e}")
+
         except Exception as e:
-            print(f"Error in monitoring: {e}")
+            print(f"[MONITOR] Error in monitoring: {e}")
             import traceback
             traceback.print_exc()
 
@@ -2153,5 +2210,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nFatal error: {e}")
         import traceback
-
         traceback.print_exc()
