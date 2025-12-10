@@ -2,11 +2,6 @@
 """
 Fyers Volume Spike Detector - Google Sheets Integration with Sector Classification
 Detects large individual trades and updates Google Sheets in real-time with sector information
-
-FIXED ISSUES:
-1. Removed duplicate function definitions
-2. Fixed Google Sheets header to use 'Trd_Val_Cr'
-3. Ensured data format consistency
 """
 
 import json
@@ -16,7 +11,7 @@ import time
 import threading
 import requests
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 import pyotp
 from fyers_apiv3 import fyersModel
@@ -46,11 +41,11 @@ FYERS_TOTP_SECRET = "7JKB7FFBMZNQRYYV7PQ46L7XRUQLR6FV"
 FYERS_PIN = "8905"
 
 # Trading Configuration
-INDIVIDUAL_TRADE_THRESHOLD = 3000000  # Rs 3 million for individual trades
+INDIVIDUAL_TRADE_THRESHOLD = 3000000  # Rs 30 lakh for individual trades
 MIN_VOLUME_SPIKE = 1000  # Minimum volume spike to consider
 
 # Google Sheets Configuration
-GOOGLE_SHEETS_ID = "1kgrKVjUm0lB0fz-74Q_C-sXls7IyyqFDGhf8NZmGG4A"  # Your Google Sheet ID
+GOOGLE_SHEETS_ID = "1kgrKVjUm0lB0fz-74Q_C-sXls7IyyqFDGhf8NZmGG4A"
 
 # =============================================================================
 # RUN CONTROLLER GLOBALS
@@ -58,7 +53,6 @@ GOOGLE_SHEETS_ID = "1kgrKVjUm0lB0fz-74Q_C-sXls7IyyqFDGhf8NZmGG4A"  # Your Google
 
 _running_flag = False
 _stop_event = threading.Event()
-_market_end_message_sent = False  # Flag to track if end message was sent today
 
 # =============================================================================
 # RUN CONTROLLER FUNCTIONS
@@ -70,7 +64,6 @@ def _start_stream_once():
     if _running_flag:
         return False
     _stop_event.clear()
-    # Start the detector in a separate thread
     threading.Thread(target=_stream_worker, args=(_stop_event,), daemon=True).start()
     _running_flag = True
     print("Stream STARTED")
@@ -82,140 +75,205 @@ def _stop_stream_once():
     if not _running_flag:
         return False
     _stop_event.set()
-    time.sleep(2)  # give your WS loop time to close
+    time.sleep(2)
     _running_flag = False
     print("Stream STOPPED")
     return False
 
 def _stream_worker(stop_event: threading.Event):
-    """
-    Simplified worker that runs the detector with proper error handling
-    No retries - single attempt only for clean restart behavior
-    """
+    """Simplified worker that runs the detector with proper error handling"""
     try:
-        print("\n" + "="*60)
-        print("[WORKER] Starting detector stream worker (single attempt)")
-        print("="*60)
-
+        print("Starting detector stream worker (single attempt)", flush=True)
         detector = VolumeSpikeDetector()
         detector.stop_event = stop_event
-
-        # Initialize and run
-        print("[WORKER] Calling detector.initialize()...")
-        init_result = detector.initialize()
-        print(f"[WORKER] Initialize returned: {init_result}")
-
-        if init_result:
-            print("[WORKER] SUCCESS - Detector initialized successfully")
-            print("[WORKER] Calling detector.start_monitoring()...")
+        
+        print("Initializing detector...", flush=True)
+        if detector.initialize():
+            print("Detector initialized successfully", flush=True)
+            print("Starting monitoring...", flush=True)
             detector.start_monitoring()
-            print("[WORKER] start_monitoring() returned - detector finished")
+            print("Monitoring ended normally", flush=True)
         else:
-            print("[WORKER] FAILED - Detector initialization failed - exiting")
+            print("Detector initialization failed - exiting", flush=True)
             return
-
+            
     except Exception as e:
-        print(f"[WORKER] Stream worker error: {e}")
+        print(f"Stream worker error: {e}", flush=True)
         import traceback
         traceback.print_exc()
-        print("[WORKER] Stream worker exiting due to error")
+        print("Stream worker exiting due to error", flush=True)
         return
-
-    print("[WORKER] Stream worker stopped normally")
+    
+    print("Stream worker stopped", flush=True)
 
 def _inside_window_ist() -> bool:
     """Check if current IST time is within market hours."""
+    # Check if force start flag is set
+    import builtins
+    if hasattr(builtins, 'FORCE_START') and builtins.FORCE_START:
+        return True  # Always return True when forced
+    
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     hhmm = now.strftime("%H:%M")
     return MARKET_START_TIME <= hhmm < MARKET_END_TIME
 
 def supervisor_loop():
-    """
-    Simplified supervisor that manages the detector lifecycle
-    """
-    global _market_end_message_sent
-
-    print("Supervisor loop started")
+    """Simplified supervisor that manages the detector lifecycle"""
+    print("Supervisor loop started", flush=True)
     detector = None
     last_auth_check = time.time()
-    AUTH_CHECK_INTERVAL = 3600  # Check auth every hour
-    last_market_check_date = None
-    outside_market_hours_logged = False
-
+    last_command_check = time.time()
+    AUTH_CHECK_INTERVAL = 3600
+    COMMAND_CHECK_INTERVAL = 3  # Check for commands every 10 seconds
+    
+    # Create telegram handler for checking commands
+    telegram = TelegramHandler()
+    
     while True:
         try:
             current_time = time.time()
-
-            # Track date changes to reset flags
-            now = datetime.now(ZoneInfo("Asia/Kolkata"))
-            current_date = now.strftime("%Y-%m-%d")
-
-            if last_market_check_date != current_date:
-                # New day - reset flags
-                _market_end_message_sent = False
-                outside_market_hours_logged = False
-                last_market_check_date = current_date
-                print(f"New day detected: {current_date} - reset market hour flags")
-
-            # Check if we're in market hours
-            if SCHEDULING_ENABLED and not _inside_window_ist():
-                if detector:
-                    if not outside_market_hours_logged:
-                        print("Outside market hours, stopping detector...")
-                        outside_market_hours_logged = True
+            
+            # Check for force/restart commands periodically
+            if current_time - last_command_check > COMMAND_CHECK_INTERVAL:
+                print("[SUPERVISOR] Checking for commands...", flush=True)
+                
+                # Check for force command
+                if telegram.check_for_force_command():
+                    print("[SUPERVISOR] Force command detected! Setting FORCE_START flag", flush=True)
+                    telegram.send_message("🚀 <b>Force Start Initiated</b>\n\n⏳ Bypassing market hours...\n📊 Starting detector immediately...")
+                    import builtins
+                    builtins.FORCE_START = True
+                
+                # Check for restart command
+                if telegram.check_for_restart_command():
+                    print("[SUPERVISOR] Restart command detected! Restarting detector only...", flush=True)
+                    
+                    # Send status message
+                    telegram.send_message("🔄 <b>Restarting Detector...</b>\n\n⏳ Stopping current detector process...")
+                    
+                    # Stop only the detector, not the summary scheduler
                     _stop_stream_once()
                     detector = None
+                    
+                    telegram.send_message("✅ Detector stopped\n⏳ Starting fresh detector instance...")
+                    
+                    time.sleep(2)
+                    
+                    # Create new detector instance
+                    try:
+                        detector = VolumeSpikeDetector()
+                        telegram.send_message("🔧 Detector instance created\n⏳ Initializing...")
+                        
+                        _start_stream_once()
+                        
+                        telegram.send_message("✅ <b>Detector Restarted Successfully!</b>\n\n📊 Status: Monitoring active\n⏰ Time: " + datetime.now().strftime('%H:%M:%S'))
+                        print("[SUPERVISOR] Detector restarted successfully", flush=True)
+                        
+                    except Exception as restart_error:
+                        error_msg = f"❌ <b>Restart Failed</b>\n\nError: {str(restart_error)}\n\nPlease try again or check logs."
+                        telegram.send_message(error_msg)
+                        print(f"[SUPERVISOR] Restart error: {restart_error}", flush=True)
+                    
+                    # Continue to next iteration
+                    last_command_check = current_time
+                    continue
+                
+                last_command_check = current_time
+            
+            # Check if we're in market hours
+            in_window = _inside_window_ist()
+            
+            if SCHEDULING_ENABLED and not in_window:
+                if detector:
+                    print("Outside market hours, stopping detector...", flush=True)
+                    _stop_stream_once()
+                    detector = None
+                # Don't spam logs, only print occasionally
+                if int(current_time) % 300 == 0:  # Every 5 minutes
+                    print("Waiting for market hours (or send 'force' command)...", flush=True)
                 time.sleep(60)
                 continue
-
-            # We are in market hours - reset the flag
-            outside_market_hours_logged = False
-
+            
             # We should be running - start detector if not running
             if not detector or not _running_flag:
-                print("Starting detector...")
-                _stop_stream_once()  # Clean stop if anything is running
+                print("Starting detector...", flush=True)
+                _stop_stream_once()
                 time.sleep(2)
+                
+                try:
+                    detector = VolumeSpikeDetector()
+                    print("Detector instance created, starting stream...", flush=True)
+                    _start_stream_once()
+                    print("Stream started successfully", flush=True)
+                    
+                    # Send connection status to user after successful start
+                    try:
+                        # Wait a moment for initialization to complete
+                        time.sleep(3)
+                        
+                        # Check if detector is actually running and authenticated
+                        if detector and hasattr(detector, 'authenticator') and detector.authenticator.is_authenticated:
+                            # Get user info if available
+                            user_name = "Unknown"
+                            try:
+                                if detector.authenticator.fyers_model:
+                                    profile = detector.authenticator.fyers_model.get_profile()
+                                    if profile.get('s') == 'ok':
+                                        user_name = profile['data']['name']
+                            except:
+                                pass
+                            
+                            connection_msg = f"""✅ <b>Detector Connected Successfully!</b>
 
-                # Create new detector instance
-                detector = VolumeSpikeDetector()
-                _start_stream_once()
+👤 <b>User:</b> {user_name}
+📊 <b>Status:</b> Monitoring Active
+🎯 <b>Symbols:</b> {len(STOCK_SYMBOLS)} stocks
+💰 <b>Threshold:</b> Rs {INDIVIDUAL_TRADE_THRESHOLD/10000000:.1f} Cr
+⏰ <b>Started:</b> {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}
 
+🔔 You will receive alerts for large volume spikes!"""
+                            
+                            telegram.send_message(connection_msg)
+                            print("Connection status sent to user", flush=True)
+                            
+                    except Exception as msg_error:
+                        print(f"Could not send connection message: {msg_error}", flush=True)
+                        
+                except Exception as start_error:
+                    print(f"Error starting detector: {start_error}", flush=True)
+                    telegram.send_message(f"❌ <b>Detector Start Failed</b>\n\nError: {str(start_error)}\n\nWill retry in 30 seconds...")
+                    time.sleep(30)
+                
             # Periodic auth check (every hour)
             if current_time - last_auth_check > AUTH_CHECK_INTERVAL:
-                print("Performing periodic auth check...")
+                print("Performing periodic auth check...", flush=True)
                 if detector and hasattr(detector, 'authenticator'):
                     if not detector.authenticator.is_authenticated:
-                        print("Auth expired, will re-authenticate on next cycle")
+                        print("Auth expired, will re-authenticate on next cycle", flush=True)
                         _stop_stream_once()
                         detector = None
                 last_auth_check = current_time
-
+            
             # Sleep before next check
-            time.sleep(30)
-
+            time.sleep(5)  # Check more frequently
+            
         except Exception as e:
-            print(f"Supervisor error: {e}")
+            print(f"Supervisor error: {e}", flush=True)
             import traceback
             traceback.print_exc()
             time.sleep(10)
 
 # Load Google Credentials from Environment Variables
 try:
-    # Try to load credentials from environment variable
     google_creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
     if google_creds_json:
-        # Process the JSON string to handle newlines properly
         GOOGLE_CREDENTIALS = json.loads(google_creds_json)
-        # Ensure private key newlines are properly formatted
         if 'private_key' in GOOGLE_CREDENTIALS:
             GOOGLE_CREDENTIALS['private_key'] = GOOGLE_CREDENTIALS['private_key'].replace('\\n', '\n')
         print("Google Sheets credentials loaded from environment variable")
     else:
-        # Fallback: try to load from individual environment variables
         private_key = os.getenv('GOOGLE_PRIVATE_KEY')
         if private_key:
-            # Ensure newlines are properly handled in private key
             private_key = private_key.replace('\\n', '\n')
         
         GOOGLE_CREDENTIALS = {
@@ -232,7 +290,6 @@ try:
             "universe_domain": "googleapis.com"
         }
         
-        # Check if all required fields are present
         required_fields = ['project_id', 'private_key_id', 'private_key', 'client_email', 'client_id']
         missing_fields = [field for field in required_fields if not GOOGLE_CREDENTIALS.get(field)]
         
@@ -251,7 +308,6 @@ except Exception as e:
 
 # Load Fyers Access Token from JSON file or environment variables
 try:
-    # Try to load from JSON file first
     with open('fyers_access_token.json', 'r') as f:
         token_data = json.load(f)
         FYERS_ACCESS_TOKEN = token_data.get('access_token', '')
@@ -259,30 +315,26 @@ try:
         FYERS_TOKEN_CREATED_AT = token_data.get('created_at', '')
         print("Fyers access token loaded from JSON file")
 except FileNotFoundError:
-    # Fallback to environment variables
     FYERS_ACCESS_TOKEN = os.getenv('FYERS_ACCESS_TOKEN', '')
     FYERS_TOKEN_TIMESTAMP = float(os.getenv('FYERS_TOKEN_TIMESTAMP', '0'))
     FYERS_TOKEN_CREATED_AT = os.getenv('FYERS_TOKEN_CREATED_AT', '')
     print("Fyers access token JSON file not found, using environment variables")
 except Exception as e:
-    # Fallback to environment variables on any error
     FYERS_ACCESS_TOKEN = os.getenv('FYERS_ACCESS_TOKEN', '')
     FYERS_TOKEN_TIMESTAMP = float(os.getenv('FYERS_TOKEN_TIMESTAMP', '0'))
     FYERS_TOKEN_CREATED_AT = os.getenv('FYERS_TOKEN_CREATED_AT', '')
     print(f"Error loading Fyers token from JSON: {e}, using environment variables")
 
-# Function to validate Fyers token from JSON file
 def validate_fyers_token_from_json():
     """Validate if the Fyers token from JSON file is still valid"""
     try:
         if not FYERS_ACCESS_TOKEN or FYERS_ACCESS_TOKEN.strip() == "":
             return False, "No token available"
         
-        # Check if token is expired (8 hours = 28800 seconds)
         current_time = time.time()
         token_time = FYERS_TOKEN_TIMESTAMP
         
-        if current_time - token_time < 28800:  # 8 hours
+        if current_time - token_time < 28800:
             print("Fyers token from JSON file is valid")
             return True, "Token is valid"
         else:
@@ -293,7 +345,6 @@ def validate_fyers_token_from_json():
         print(f"Error validating Fyers token: {e}")
         return False, f"Validation error: {str(e)}"
 
-# Function to save Fyers token to JSON file
 def save_fyers_token_to_json(access_token, timestamp=None, created_at=None):
     """Save Fyers access token to JSON file"""
     try:
@@ -318,13 +369,13 @@ def save_fyers_token_to_json(access_token, timestamp=None, created_at=None):
         print(f"Error saving Fyers token to JSON: {e}")
         return False
 
-# Telegram Configuration - Hardcoded
+# Telegram Configuration - For Detector
 TELEGRAM_BOT_TOKEN = "8303548716:AAF2jXwncMuW8VvI3wl8l4RXObDgkDvCvfo"
 TELEGRAM_CHAT_ID = "5715256800"
 TELEGRAM_POLLING_INTERVAL = 5
 TELEGRAM_AUTH_TIMEOUT = 300
 
-# Summary Telegram Bot Configuration
+# Summary Telegram Bot Configuration - SEPARATE CREDENTIALS
 SUMMARY_TELEGRAM_BOT_TOKEN = "8225228168:AAFVxVL_ygeTz8IDVIt7Qp1qlkra7qgoAKY"
 SUMMARY_TELEGRAM_CHAT_ID = "8388919023"
 SUMMARY_SEND_TIME = "16:30"  # 4:30 PM IST
@@ -714,111 +765,14 @@ SECTOR_MAPPING = {
     # Fintech & Digital Services
     "NSE:GROWW-EQ": "Financial Services",
 }
+
 def get_sector_for_symbol(symbol):
     """Get sector for a given symbol"""
     return SECTOR_MAPPING.get(symbol, "Others")
 
 # =============================================================================
-# SCHEDULING UTILITIES
+# STOCK SYMBOLS (keeping existing list)
 # =============================================================================
-
-def is_market_time():
-    """Check if current time is within market hours"""
-    if not SCHEDULING_ENABLED:
-        return True
-    
-    current_time = datetime.now()
-    current_time_str = current_time.strftime("%H:%M")
-    
-    return MARKET_START_TIME <= current_time_str <= MARKET_END_TIME
-
-def get_time_until_market_start():
-    """Get time until market starts (in seconds)"""
-    current_time = datetime.now()
-    start_hour, start_minute = map(int, MARKET_START_TIME.split(":"))
-    market_start = current_time.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
-    
-    if current_time.time() >= market_start.time():
-        return 0
-    
-    time_diff = market_start - current_time
-    return time_diff.total_seconds()
-
-def get_time_until_market_end():
-    """Get time until market ends (in seconds)"""
-    current_time = datetime.now()
-    end_hour, end_minute = map(int, MARKET_END_TIME.split(":"))
-    market_end = current_time.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
-    
-    if current_time.time() >= market_end.time():
-        return 0
-    
-    time_diff = market_end - current_time
-    return time_diff.total_seconds()
-
-def wait_for_market_start():
-    """Wait until market start time"""
-    if not SCHEDULING_ENABLED:
-        return
-    
-    while not is_market_time():
-        time_until_start = get_time_until_market_start()
-        if time_until_start > 0:
-            hours = int(time_until_start // 3600)
-            minutes = int((time_until_start % 3600) // 60)
-            seconds = int(time_until_start % 60)
-            
-            print(f"Waiting for market to start at {MARKET_START_TIME}...")
-            print(f"   Time remaining: {hours:02d}:{minutes:02d}:{seconds:02d}")
-            
-            if int(time_until_start) % 1800 == 0:
-                status_message = f"""
-<b>Market Schedule Status</b>
-
-<b>Current Time:</b> {datetime.now().strftime('%H:%M:%S')}
-<b>Market Start:</b> {MARKET_START_TIME}
-<b>Time Remaining:</b> {hours:02d}:{minutes:02d}:{seconds:02d}
-
-<b>Status:</b> Waiting for market to open
-                """
-                telegram_handler = TelegramHandler()
-                telegram_handler.send_message(status_message)
-            
-            time.sleep(60)
-        else:
-            break
-    
-    print(f"Market is now open! Starting monitoring at {datetime.now().strftime('%H:%M:%S')}")
-
-def check_market_end():
-    """Check if market has ended and stop monitoring"""
-    global _market_end_message_sent
-    
-    if not SCHEDULING_ENABLED:
-        return False
-    
-    if not is_market_time():
-        # Only send message once per day
-        if not _market_end_message_sent:
-            print(f"Market has ended at {MARKET_END_TIME}. Stopping monitoring...")
-            
-            end_message = f"""<b>Market Session Ended</b>
-
-<b>End Time:</b> {datetime.now().strftime('%H:%M:%S')}
-<b>Session Duration:</b> {MARKET_START_TIME} - {MARKET_END_TIME}
-
-<b>Monitoring Status:</b> Stopped
-<b>Next Session:</b> Tomorrow at {MARKET_START_TIME}
-            """
-            telegram_handler = TelegramHandler()
-            telegram_handler.send_message(end_message)
-            _market_end_message_sent = True
-        
-        return True
-    
-    # Reset flag when market is open
-    _market_end_message_sent = False
-    return False
 
 STOCK_SYMBOLS = [
     'NSE:ROLLT-EQ',
@@ -1043,14 +997,10 @@ STOCK_SYMBOLS = [
     'NSE:MRPL-EQ'
 ]
 
-def get_sector_for_symbol(symbol):
-    """Get sector for a given symbol"""
-    return SECTOR_MAPPING.get(symbol, "Others")
-
 MAX_SYMBOLS = len(STOCK_SYMBOLS)
 
 # =============================================================================
-# TELEGRAM HANDLER FOR AUTOMATED AUTHENTICATION
+# TELEGRAM HANDLER FOR DETECTOR AUTHENTICATION
 # =============================================================================
 
 class TelegramHandler:
@@ -1070,11 +1020,7 @@ class TelegramHandler:
                 "parse_mode": "HTML"
             }
             response = requests.post(url, data=data, timeout=10)
-            if response.status_code == 200:
-                return True
-            else:
-                print(f"Failed to send Telegram message: {response.text}")
-                return False
+            return response.status_code == 200
         except Exception as e:
             print(f"Error sending Telegram message: {e}")
             return False
@@ -1088,16 +1034,23 @@ class TelegramHandler:
                 "timeout": 30
             }
             response = requests.get(url, params=params, timeout=35)
+            
             if response.status_code == 200:
                 data = response.json()
                 if data.get("ok") and data.get("result"):
                     updates = data["result"]
                     if updates:
                         self.last_update_id = updates[-1]["update_id"]
+                        print(f"[TELEGRAM] Received {len(updates)} updates, last ID: {self.last_update_id}", flush=True)
                     return updates
+                else:
+                    print(f"[TELEGRAM] Response OK but no results: {data}", flush=True)
+            else:
+                print(f"[TELEGRAM] Bad response: {response.status_code}", flush=True)
+            
             return []
         except Exception as e:
-            print(f"Error getting Telegram updates: {e}")
+            print(f"[TELEGRAM] Error getting updates: {e}", flush=True)
             return []
     
     def extract_auth_code(self, message_text):
@@ -1118,14 +1071,13 @@ class TelegramHandler:
                 return auth_code
             
             print("No auth_code found in message")
-            print(f"Message content: {message_text[:100]}...")
             return None
         except Exception as e:
             print(f"Error extracting auth code: {e}")
             return None
     
     def wait_for_auth_code(self, timeout_seconds=TELEGRAM_AUTH_TIMEOUT):
-        """Wait for auth code message from Telegram with network error handling"""
+        """Wait for auth code message from Telegram"""
         print(f"Waiting for auth code from Telegram (timeout: {timeout_seconds}s)...")
         start_time = time.time()
         
@@ -1137,23 +1089,70 @@ class TelegramHandler:
                     if "message" in update and "text" in update["message"]:
                         message_text = update["message"]["text"]
                         
-                        if "auth_code=" in message_text:
+                        if "fyersauth.vercel.app" in message_text and "auth_code=" in message_text:
                             auth_code = self.extract_auth_code(message_text)
                             if auth_code:
-                                print("Auth code received successfully!")
                                 return auth_code
                 
                 time.sleep(TELEGRAM_POLLING_INTERVAL)
                 
             except Exception as e:
-                print(f"Error while waiting for auth code: {e}")
-                time.sleep(TELEGRAM_POLLING_INTERVAL)
+                print(f"Telegram connection error: {e}")
+                time.sleep(10)
         
-        print("Timeout waiting for auth code")
+        print("Timeout waiting for auth code from Telegram")
         return None
+    
+    def check_for_restart_command(self):
+        """Check for restart command in Telegram messages"""
+        try:
+            print("Checking Telegram for restart command...", flush=True)
+            updates = self.get_updates()
+            
+            for update in updates:
+                if "message" in update and "text" in update["message"]:
+                    message_text = update["message"]["text"].strip()
+                    print(f"Received message: '{message_text}'", flush=True)
+                    
+                    # Check various forms of restart command (case insensitive)
+                    if message_text.lower() in ["restart", "restart!", "restart.", "restart bot", "restart system", "reboot"]:
+                        print(f"Restart command received: '{message_text}'", flush=True)
+                        self.send_message("Restart command received! Initiating restart...")
+                        return True
+            
+            return False
+        except Exception as e:
+            print(f"Error checking for restart command: {e}", flush=True)
+            return False
+
+    def check_for_force_command(self):
+        """Check for Force command in Telegram messages"""
+        try:
+            print("Checking Telegram for force command...", flush=True)
+            updates = self.get_updates()
+            print(f"Got {len(updates)} Telegram updates", flush=True)
+            
+            for update in updates:
+                if "message" in update and "text" in update["message"]:
+                    message_text = update["message"]["text"].strip()
+                    print(f"Received message: '{message_text}'", flush=True)
+                    
+                    # Check various forms of force command (case insensitive)
+                    if message_text.lower() in ["force", "start", "start now"]:
+                        print(f"Force command detected: '{message_text}'", flush=True)
+                        self.send_message("Force command received! Starting detector immediately, bypassing market hours.")
+                        return True
+            
+            print("No force command found in messages", flush=True)
+            return False
+        except Exception as e:
+            print(f"Error checking for Force command: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return False
 
 # =============================================================================
-# SUMMARY TELEGRAM HANDLER
+# SUMMARY TELEGRAM HANDLER - SEPARATE BOT
 # =============================================================================
 
 class SummaryTelegramHandler:
@@ -1163,7 +1162,7 @@ class SummaryTelegramHandler:
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self.last_update_id = 0
         self.stop_sending_today = False
-
+        
     def send_message(self, message):
         """Send a message to Telegram"""
         try:
@@ -1183,26 +1182,7 @@ class SummaryTelegramHandler:
         except Exception as e:
             print(f"Error sending summary message: {e}")
             return False
-
-    def send_messages(self, messages):
-        """Send multiple messages to Telegram"""
-        try:
-            success_count = 0
-            for i, message in enumerate(messages, 1):
-                print(f"\nSending message {i}/{len(messages)}...")
-                if self.send_message(message):
-                    success_count += 1
-                    time.sleep(1)  # Small delay between messages
-                else:
-                    print(f"Failed to send message {i}")
-
-            print(f"\nSent {success_count}/{len(messages)} messages successfully")
-            return success_count == len(messages)
-
-        except Exception as e:
-            print(f"Error sending multiple messages: {e}")
-            return False
-
+    
     def get_updates(self):
         """Get latest messages from Telegram"""
         try:
@@ -1227,17 +1207,20 @@ class SummaryTelegramHandler:
     def check_for_done_message(self):
         """Check if 'done' message has been received"""
         try:
+            print("Checking Telegram for done command...", flush=True)
             updates = self.get_updates()
             for update in updates:
                 if "message" in update and "text" in update["message"]:
                     text = update["message"]["text"].strip().lower()
-                    if text == "done":
-                        print("'Done' message received - stopping summaries for today")
+                    print(f"Summary bot received: '{text}'", flush=True)
+                    if text in ["done", "stop", "stop summary", "enough"]:
+                        print("'Done' message received - stopping summaries for today", flush=True)
+                        self.send_message("✅ Summaries stopped for today. Will resume tomorrow.")
                         self.stop_sending_today = True
                         return True
             return False
         except Exception as e:
-            print(f"Error checking for done message: {e}")
+            print(f"Error checking for done message: {e}", flush=True)
             return False
     
     def check_for_send_message(self):
@@ -1247,16 +1230,17 @@ class SummaryTelegramHandler:
             for update in updates:
                 if "message" in update and "text" in update["message"]:
                     text = update["message"]["text"].strip().lower()
-                    if text == "send":
-                        print("'Send' message received - will send immediate summary")
+                    if text in ["send", "send summary", "summary", "report"]:
+                        print("'Send' message received - will send immediate summary", flush=True)
+                        self.send_message("⏳ Generating summary...")
                         return True
             return False
         except Exception as e:
-            print(f"Error checking for send message: {e}")
+            print(f"Error checking for send message: {e}", flush=True)
             return False
 
 # =============================================================================
-# GOOGLE SHEETS SUMMARY EXTRACTOR
+# DAILY SUMMARY GENERATOR
 # =============================================================================
 
 class DailySummaryGenerator:
@@ -1292,28 +1276,23 @@ class DailySummaryGenerator:
                 if not self.initialize_sheets():
                     return []
             
-            # Get current date in multiple formats
             now = datetime.now(ZoneInfo("Asia/Kolkata"))
             today_formats = [
-                now.strftime("%d-%m-%Y"),    # 15-10-2025
-                now.strftime("%Y-%m-%d"),    # 2025-10-15
-                now.strftime("%d/%m/%Y"),    # 15/10/2025
-                now.strftime("%m/%d/%Y"),    # 10/15/2025
-                now.strftime("%d-%m-%y"),    # 15-10-25
+                now.strftime("%Y-%m-%d"),
+                now.strftime("%d-%m-%Y"),
+                now.strftime("%d/%m/%Y"),
+                now.strftime("%m/%d/%Y"),
             ]
             
-            # Get all values including headers
             all_values = self.worksheet.get_all_values()
             
             if not all_values or len(all_values) < 2:
                 print("No data in sheet")
                 return []
             
-            # First row is headers
             headers = all_values[0]
             print(f"Sheet headers: {headers}")
             
-            # Find column indices
             date_col_idx = None
             symbol_col_idx = None
             value_col_idx = None
@@ -1321,48 +1300,25 @@ class DailySummaryGenerator:
             for idx, header in enumerate(headers):
                 header_lower = header.lower().strip()
                 
-                # Match Date column
                 if header_lower == 'date':
                     date_col_idx = idx
-                    print(f"OK Found Date column at index {idx}")
-                
-                # Match Symbol column
                 elif header_lower == 'symbol':
                     symbol_col_idx = idx
-                    print(f"OK Found Symbol column at index {idx}")
-                
-                # Match Value column - looking for Trd_Val_Cr or similar
-                elif ('trd' in header_lower and 'val' in header_lower and 'cr' in header_lower) or \
-                     ('value' in header_lower and ('cr' in header_lower or 'crore' in header_lower)):
+                elif 'trd' in header_lower and 'val' in header_lower and 'cr' in header_lower:
                     value_col_idx = idx
-                    print(f"OK Found Value column at index {idx}: '{header}'")
             
             if date_col_idx is None or symbol_col_idx is None or value_col_idx is None:
-                print(f"ERROR Required columns not found!")
-                print(f"   Date column index: {date_col_idx}")
-                print(f"   Symbol column index: {symbol_col_idx}")
-                print(f"   Value column index: {value_col_idx}")
-                print(f"\nINFO Looking for columns named:")
-                print(f"   - 'Date' (exact match)")
-                print(f"   - 'Symbol' (exact match)")
-                print(f"   - 'Trd_Val_Cr' or 'Value (Rs Crores)' or similar")
+                print(f"Required columns not found!")
                 return []
             
-            print(f"\nOK All required columns found!")
-            print(f"  Date: column {date_col_idx}")
-            print(f"  Symbol: column {symbol_col_idx}")
-            print(f"  Value: column {value_col_idx} ('{headers[value_col_idx]}')")
-            
-            # Process data rows
             today_records = []
             
-            for row_idx, row in enumerate(all_values[1:], start=2):  # Skip header row
+            for row in all_values[1:]:
                 if len(row) <= max(date_col_idx, symbol_col_idx, value_col_idx):
                     continue
                 
                 date_value = str(row[date_col_idx]).strip()
                 
-                # Check if date matches today
                 is_today = False
                 for date_format in today_formats:
                     if date_value == date_format or date_value.startswith(date_format):
@@ -1380,181 +1336,52 @@ class DailySummaryGenerator:
                     }
                     today_records.append(record)
             
-            print(f"\nData Summary:")
-            print(f"   Total rows in sheet: {len(all_values) - 1}")
-            print(f"   Records for today ({today_formats[0]}): {len(today_records)}")
-            
-            # Debug: Print first few records
-            if today_records:
-                print(f"\nSample records (first 3):")
-                for i, record in enumerate(today_records[:3], 1):
-                    print(f"   {i}. {record['Date']} | {record['Symbol']:20s} | Rs.{record['Trd_Val_Cr']} Cr")
-            else:
-                print(f"\nWARNING No records found for today's date: {today_formats[0]}")
-                print(f"   Sample dates in sheet:")
-                for row in all_values[1:6]:  # Show first 5 dates
-                    if len(row) > date_col_idx:
-                        print(f"   - {row[date_col_idx]}")
-            
+            print(f"Records for today: {len(today_records)}")
             return today_records
             
         except Exception as e:
-            print(f"ERROR getting today's data: {e}")
+            print(f"Error getting today's data: {e}")
             import traceback
             traceback.print_exc()
             return []
     
-    def get_date_range_data(self, days_back=0):
-        """Get data for a specific date range"""
-        try:
-            if not self.worksheet:
-                if not self.initialize_sheets():
-                    return []
-            
-            # Calculate target dates
-            now = datetime.now(ZoneInfo("Asia/Kolkata"))
-            target_dates = []
-            
-            for i in range(days_back + 1):
-                target_date = now - timedelta(days=i)
-                date_formats = [
-                    target_date.strftime("%d-%m-%Y"),    # 15-10-2025
-                    target_date.strftime("%Y-%m-%d"),    # 2025-10-15
-                    target_date.strftime("%d/%m/%Y"),    # 15/10/2025
-                    target_date.strftime("%m/%d/%Y"),    # 10/15/2025
-                    target_date.strftime("%d-%m-%y"),    # 15-10-25
-                ]
-                target_dates.extend(date_formats)
-            
-            # Get all values including headers
-            all_values = self.worksheet.get_all_values()
-            
-            if not all_values or len(all_values) < 2:
-                print("No data in sheet")
-                return []
-            
-            # First row is headers
-            headers = all_values[0]
-            
-            # Find column indices (same logic as get_today_data)
-            date_col_idx = None
-            symbol_col_idx = None
-            value_col_idx = None
-            
-            for idx, header in enumerate(headers):
-                header_lower = header.lower().strip()
-                
-                if header_lower == 'date':
-                    date_col_idx = idx
-                elif header_lower == 'symbol':
-                    symbol_col_idx = idx
-                elif ('trd' in header_lower and 'val' in header_lower and 'cr' in header_lower) or \
-                     ('value' in header_lower and ('cr' in header_lower or 'crore' in header_lower)):
-                    value_col_idx = idx
-            
-            if date_col_idx is None or symbol_col_idx is None or value_col_idx is None:
-                print(f"ERROR Required columns not found for date range!")
-                return []
-            
-            # Process data rows
-            date_range_records = []
-            
-            for row_idx, row in enumerate(all_values[1:], start=2):
-                if len(row) > max(date_col_idx, symbol_col_idx, value_col_idx):
-                    date_val = row[date_col_idx].strip()
-                    symbol_val = row[symbol_col_idx].strip()
-                    value_val = row[value_col_idx].strip()
-                    
-                    if date_val in target_dates and symbol_val and value_val:
-                        try:
-                            trd_val_cr = float(value_val.replace(',', '')) if value_val else 0.0
-                            record = {
-                                'Date': date_val,
-                                'Symbol': symbol_val,
-                                'Trd_Val_Cr': trd_val_cr
-                            }
-                            date_range_records.append(record)
-                        except ValueError:
-                            continue
-            
-            return date_range_records
-            
-        except Exception as e:
-            print(f"ERROR getting date range data: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-    
-    def generate_top_15_summary(self, days_back=0, summary_type="Daily"):
+    def generate_top_15_summary(self):
         """Generate top 15 stocks summary based on count and total value"""
         try:
-            print("\n" + "="*70)
-            print(f"GENERATING TOP 15 {summary_type.upper()} SUMMARY")
-            print("="*70)
+            print("\nGENERATING TOP 15 SUMMARY")
             
-            # Step 1: Get records based on date range
-            if days_back == 0:
-                records = self.get_today_data()
-            else:
-                records = self.get_date_range_data(days_back)
+            today_records = self.get_today_data()
             
-            if not records:
-                print(f"ERROR No records found for {summary_type.lower()} - cannot generate summary")
+            if not today_records:
+                print("No records found for today")
                 return None
             
-            print(f"\nOK Processing {len(records)} records for {summary_type.lower()} summary...")
+            print(f"Processing {len(today_records)} records...")
             
-            # Step 2: Process each record
             symbol_stats = {}
-            parse_success = 0
-            parse_failed = 0
             
-            for record in records:
-                # Get symbol
+            for record in today_records:
                 symbol = record.get('Symbol', '').strip()
-                
-                # Get trade value
                 value_str = str(record.get('Trd_Val_Cr', '0')).strip()
                 
-                # Skip if symbol is empty or invalid
                 if not symbol or symbol == 'Unknown' or symbol == '':
                     continue
                 
-                # Parse the trade value
                 try:
-                    # Remove any non-numeric characters except decimal point and minus sign
                     value_clean = re.sub(r'[^\d.\-]', '', value_str)
                     trd_val = float(value_clean) if value_clean and value_clean != '-' else 0.0
-                    
-                    if trd_val > 0:
-                        parse_success += 1
-                        if parse_success <= 5:  # Show first 5 successful parses
-                            print(f"   OK {symbol:20s}: '{value_str}' -> {trd_val:.2f} Cr")
-                except (ValueError, AttributeError) as e:
+                except (ValueError, AttributeError):
                     trd_val = 0.0
-                    parse_failed += 1
-                    if parse_failed <= 3:  # Show first 3 failures
-                        print(f"   ERROR {symbol:20s}: Failed to parse '{value_str}'")
                 
-                # Initialize or update symbol stats
                 if symbol not in symbol_stats:
                     symbol_stats[symbol] = {
                         'count': 0,
                         'total_trd_val_cr': 0.0
                     }
                 
-                # Increment count
                 symbol_stats[symbol]['count'] += 1
-                
-                # Add to total value
                 symbol_stats[symbol]['total_trd_val_cr'] += trd_val
             
-            print(f"\nParsing Results:")
-            print(f"   OK Successfully parsed: {parse_success}")
-            print(f"   ERROR Failed to parse: {parse_failed}")
-            print(f"   INFO Unique symbols: {len(symbol_stats)}")
-            
-            # Step 3: Sort by count and get top 15
             sorted_symbols = sorted(
                 symbol_stats.items(),
                 key=lambda x: x[1]['count'],
@@ -1563,58 +1390,38 @@ class DailySummaryGenerator:
             
             top_15 = sorted_symbols[:15]
             
-            print(f"\n{'='*70}")
-            print("TOP 15 SYMBOLS BY COUNT")
-            print(f"{'='*70}")
-            print(f"{'Rank':<6} {'Symbol':<20} {'Count':<8} {'Total Value (Cr)':<18} {'Avg/Trade (Cr)'}")
-            print("-"*70)
-            
+            print(f"TOP 15 SYMBOLS BY COUNT")
             for i, (symbol, stats) in enumerate(top_15, 1):
-                count = stats['count']
-                total_val = stats['total_trd_val_cr']
-                avg_val = total_val / count if count > 0 else 0
-                
-                print(f"{i:2d}.   {symbol:<20} {count:<8} Rs.{total_val:>15,.2f}  Rs.{avg_val:>10,.2f}")
+                print(f"{i}. {symbol}: {stats['count']} trades, Rs{stats['total_trd_val_cr']:.2f} Cr")
             
-            print("="*70 + "\n")
-            
-            return top_15, len(records), len(symbol_stats)
+            return top_15, len(today_records), len(symbol_stats)
             
         except Exception as e:
-            print(f"ERROR generating summary: {e}")
+            print(f"Error generating summary: {e}")
             import traceback
             traceback.print_exc()
             return None
     
-    def format_single_summary_message(self, days_back=0, summary_type="Daily"):
-        """Format a single summary message for Telegram"""
+    def format_summary_message(self):
+        """Format the summary message for Telegram"""
         try:
-            result = self.generate_top_15_summary(days_back, summary_type)
+            result = self.generate_top_15_summary()
             
             if not result:
-                return f"No volume spike data available for {summary_type.lower()}'s summary"
+                return "No volume spike data available for today's summary"
             
             top_15, total_records, unique_symbols = result
+            today_date = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d-%m-%Y")
             
-            # Get date range info
-            now = datetime.now(ZoneInfo("Asia/Kolkata"))
-            if days_back == 0:
-                date_info = now.strftime("%d-%m-%Y")
-            else:
-                end_date = now
-                start_date = now - timedelta(days=days_back)
-                date_info = f"{start_date.strftime('%d-%m-%Y')} to {end_date.strftime('%d-%m-%Y')}"
-            
-            # Calculate total value across top 15 stocks
             total_top15_value = sum(stats['total_trd_val_cr'] for _, stats in top_15)
             
-            message = f"""<b>{summary_type} Volume Spike Summary</b>
-Date: {date_info}
-Total Records: {total_records}
-Unique Symbols: {unique_symbols}
-Top 15 Total Value: Rs.{total_top15_value:,.2f} Cr
+            message = f"""<b>📊 Daily Volume Spike Summary</b>
+📅 Date: {today_date}
+📈 Total Records: {total_records}
+🔢 Unique Symbols: {unique_symbols}
+💰 Top 15 Total Value: ₹{total_top15_value:,.2f} Cr
 
-<b>TOP 15 RANKINGS (by Count):</b>
+<b>🏆 TOP 15 RANKINGS (by Count):</b>
 
 """
             
@@ -1624,63 +1431,27 @@ Top 15 Total Value: Rs.{total_top15_value:,.2f} Cr
                 avg_per_trade = total_trd_val_cr / count if count > 0 else 0
                 
                 message += f"""{idx}. <b>{symbol}</b>
-   Count: <b>{count}</b> trades
-   Total Value: Rs.{total_trd_val_cr:,.2f} Cr
-   Avg per Trade: Rs.{avg_per_trade:.2f} Cr
+   📊 Count: <b>{count}</b> trades
+   💵 Total Value: ₹{total_trd_val_cr:,.2f} Cr
+   📉 Avg per Trade: ₹{avg_per_trade:.2f} Cr
    
 """
             
-            message += f"""====================
-<i>Analysis Complete for {date_info}</i>
-<i>Ranked by highest trade count</i>
-<i>Values from Trd_Val_Cr column</i>
+            message += f"""━━━━━━━━━━━━━━━━━━━━
+📊 <i>Analysis Complete for {today_date}</i>
+🎯 <i>Ranked by highest trade count</i>
+📈 <i>Values from Trd_Val_Cr column</i>
 
-Reply 'send' for fresh summary or 'done' to stop
+Reply 'send' for fresh summary or 'done' to stop today
 """
             
             return message
             
         except Exception as e:
-            print(f"ERROR formatting {summary_type.lower()} summary message: {e}")
+            print(f"Error formatting summary message: {e}")
             import traceback
             traceback.print_exc()
-            return f"ERROR generating {summary_type.lower()} summary: {str(e)}"
-    
-    def format_summary_message(self):
-        """Format the summary message for Telegram with day-specific logic"""
-        try:
-            now = datetime.now(ZoneInfo("Asia/Kolkata"))
-            current_day = now.strftime("%A")  # Monday, Tuesday, etc.
-
-            print(f"Today is {current_day} - determining summary types...")
-
-            messages = []
-
-            # Always send daily summary
-            print("Generating daily summary...")
-            daily_summary = self.format_single_summary_message(0, "Daily")
-            messages.append(daily_summary)
-
-            # Wednesday and Friday: Add 3-day summary
-            if current_day in ["Wednesday", "Friday"]:
-                print("Generating 3-day summary...")
-                three_day_summary = self.format_single_summary_message(2, "3-Day")
-                messages.append(three_day_summary)
-
-            # Friday only: Add weekly summary
-            if current_day == "Friday":
-                print("Generating weekly summary...")
-                weekly_summary = self.format_single_summary_message(4, "Weekly")
-                messages.append(weekly_summary)
-
-            print(f"Generated {len(messages)} summary types")
-            return messages
-
-        except Exception as e:
-            print(f"ERROR formatting summary message: {e}")
-            import traceback
-            traceback.print_exc()
-            return [f"ERROR generating summary: {str(e)}"]
+            return f"Error generating summary: {str(e)}"
 
 # =============================================================================
 # SUMMARY SCHEDULER
@@ -1689,76 +1460,64 @@ Reply 'send' for fresh summary or 'done' to stop
 def summary_scheduler():
     """Background thread to handle summary sending"""
     print("Summary scheduler started")
-
+    
     summary_handler = SummaryTelegramHandler()
     summary_generator = DailySummaryGenerator()
-
+    
     last_sent_date = None
     last_sent_time = None
-
-    # Send summary immediately on startup for testing
-    print("\n" + "="*50)
-    print("SENDING IMMEDIATE SUMMARY ON STARTUP")
-    print("="*50)
-    try:
-        summary_messages = summary_generator.format_summary_message()
-        if summary_handler.send_messages(summary_messages):
-            print("Initial summary sent successfully")
-        else:
-            print("Failed to send initial summary")
-    except Exception as e:
-        print(f"Error sending initial summary: {e}")
-    print("="*50 + "\n")
-
+    
     while True:
         try:
             now = datetime.now(ZoneInfo("Asia/Kolkata"))
             current_date = now.strftime("%d-%m-%Y")
             current_time = now.strftime("%H:%M")
-
+            
+            # Reset on new day
             if last_sent_date != current_date:
                 summary_handler.stop_sending_today = False
                 last_sent_date = current_date
                 last_sent_time = None
                 print(f"New day started: {current_date}")
-
+            
+            # Check for done command
             summary_handler.check_for_done_message()
-
-            # Print status every 5 minutes
-            if now.minute % 5 == 0 and now.second < 10:
-                print(f"[{current_time}] Scheduler running... (waiting for {SUMMARY_SEND_TIME})")
-                print(f"   Stop flag: {summary_handler.stop_sending_today}")
-                if last_sent_time:
-                    print(f"   Last sent: {last_sent_time}")
-
-            if (current_time >= SUMMARY_SEND_TIME and
+            
+            # Check for send command
+            if summary_handler.check_for_send_message():
+                print("Manual send command received - sending summary now")
+                summary_message = summary_generator.format_summary_message()
+                summary_handler.send_message(summary_message)
+                last_sent_time = current_time
+            
+            # Automatic sending logic
+            if (current_time >= SUMMARY_SEND_TIME and 
                 not summary_handler.stop_sending_today):
-
+                
                 should_send = False
-
+                
                 if last_sent_time is None:
                     should_send = True
                 else:
                     last_dt = datetime.strptime(f"{current_date} {last_sent_time}", "%d-%m-%Y %H:%M")
                     current_dt = datetime.strptime(f"{current_date} {current_time}", "%d-%m-%Y %H:%M")
                     time_diff = (current_dt - last_dt).total_seconds()
-
+                    
                     if time_diff >= SUMMARY_SEND_INTERVAL:
                         should_send = True
-
+                
                 if should_send:
                     print(f"Sending summary at {current_time}")
-
-                    summary_messages = summary_generator.format_summary_message()
-
-                    if summary_handler.send_messages(summary_messages):
+                    summary_message = summary_generator.format_summary_message()
+                    
+                    if summary_handler.send_message(summary_message):
                         last_sent_time = current_time
                         print(f"Summary sent successfully at {current_time}")
                     else:
                         print(f"Failed to send summary at {current_time}")
-
+            
             time.sleep(60)
-
+            
         except Exception as e:
             print(f"Error in summary scheduler: {e}")
             import traceback
@@ -1776,41 +1535,48 @@ class FyersAuthenticator:
         self.redirect_uri = FYERS_REDIRECT_URI
         self.totp_secret = FYERS_TOTP_SECRET
         self.pin = FYERS_PIN
-        self.access_token = FYERS_ACCESS_TOKEN
+        self.access_token = None
+        self.fyers_model = None
+        self.telegram = TelegramHandler()
+        self.last_relogin_time = 0
+        self.relogin_interval = 300
         self.is_authenticated = False
-        self.telegram_handler = TelegramHandler()
         
     def generate_totp(self):
-        """Generate TOTP code"""
-        try:
-            totp = pyotp.TOTP(self.totp_secret)
-            totp_code = totp.now()
-            print(f"Generated TOTP: {totp_code}")
-            return totp_code
-        except Exception as e:
-            print(f"Error generating TOTP: {e}")
-            return None
+        totp = pyotp.TOTP(self.totp_secret)
+        return totp.now()
     
-    def authenticate(self):
-        """Perform fresh authentication"""
+    def load_saved_token(self):
         try:
-            print("\n" + "="*60)
-            print("[AUTH] Starting Fyers Authentication")
-            print("="*60)
-
-            print("[AUTH] Validating existing token from JSON file...")
             is_valid, message = validate_fyers_token_from_json()
-            print(f"[AUTH] Token validation result: {is_valid} - {message}")
-
-            if is_valid and FYERS_ACCESS_TOKEN:
-                print("[AUTH] SUCCESS - Using existing valid token from JSON file")
+            
+            if is_valid:
                 self.access_token = FYERS_ACCESS_TOKEN
                 self.is_authenticated = True
-                print("[AUTH] Authentication complete (using cached token)")
+                print("Using Fyers access token from JSON file")
                 return True
-
-            print("[AUTH] Performing fresh authentication...")
-
+            else:
+                print(f"{message}")
+                self.is_authenticated = False
+                self.send_relogin_message(message)
+                return False
+            
+        except Exception as e:
+            print(f"Error loading saved token: {e}")
+            self.is_authenticated = False
+            self.send_relogin_message(f"Token loading error: {str(e)}")
+            return False
+    
+    def send_relogin_message(self, reason):
+        """Send Telegram message requesting re-authentication with retry logic"""
+        current_time = time.time()
+        
+        if current_time - self.last_relogin_time < self.relogin_interval:
+            remaining_time = int(self.relogin_interval - (current_time - self.last_relogin_time))
+            print(f"Relogin message sent recently. Next message in {remaining_time} seconds")
+            return False
+        
+        try:
             session = fyersModel.SessionModel(
                 client_id=self.client_id,
                 secret_key=self.secret_key,
@@ -1818,454 +1584,472 @@ class FyersAuthenticator:
                 response_type="code",
                 grant_type="authorization_code"
             )
-
-            print("[AUTH] Generating authorization URL...")
+            
             auth_url = session.generate_authcode()
-            print(f"[AUTH] Authorization URL: {auth_url}\n")
+            totp_code = self.generate_totp()
+            
+            relogin_message = f"""
+🔐 <b>Fyers Re-Authentication Required</b>
 
-            telegram_message = f"""<b>Fyers Authentication Required</b>
+<b>Reason:</b> {reason}
 
-Please click the link below to authorize:
+<b>Authorization URL:</b>
+<code>{auth_url}</code>
 
-{auth_url}
+<b>TOTP Code:</b> <code>{totp_code}</code>
 
-After authorizing, send the complete redirect URL here.
+<b>Steps:</b>
+1. Click the URL above
+2. Login with your Fyers credentials
+3. Use TOTP code if prompted for 2FA
+4. After successful login, copy the entire redirect URL
+5. Send the redirect URL back to this bot
+
+<b>Timeout:</b> {TELEGRAM_AUTH_TIMEOUT} seconds
             """
-
-            print("[AUTH] Sending authorization request to Telegram...")
-            self.telegram_handler.send_message(telegram_message)
-
-            print("[AUTH] Waiting for auth code from user...")
-            auth_code = self.telegram_handler.wait_for_auth_code()
-
-            if not auth_code:
-                print("[AUTH] FAILED - Failed to get auth code from Telegram")
-                return False
-
-            print(f"[AUTH] SUCCESS - Auth code received: {auth_code[:20]}...")
-            print("[AUTH] Generating access token...")
-
-            session.set_token(auth_code)
-            response = session.generate_token()
-
-            if response and 'access_token' in response:
-                self.access_token = response['access_token']
-                self.is_authenticated = True
-
-                print("[AUTH] Saving token to JSON file...")
-                save_fyers_token_to_json(self.access_token)
-
-                print("[AUTH] SUCCESS - Authentication successful!")
-                print(f"[AUTH] Access Token: {self.access_token[:20]}...")
-
-                success_message = "<b>Fyers Authentication Successful!</b>\n\nDetector will now start monitoring."
-                self.telegram_handler.send_message(success_message)
-
-                print("[AUTH] Authentication complete - ready to initialize detector")
+            
+            if self.telegram.send_message(relogin_message):
+                self.last_relogin_time = current_time
+                print("Re-authentication request sent to Telegram")
                 return True
             else:
-                print(f"[AUTH] FAILED - Authentication failed: {response}")
+                print("Failed to send re-authentication request to Telegram")
                 return False
-
+                
         except Exception as e:
-            print(f"[AUTH] ERROR - Error during authentication: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error sending re-authentication message: {e}")
             return False
     
-    def get_access_token(self):
-        """Get the access token"""
-        if not self.is_authenticated:
+    def save_token(self, token):
+        global FYERS_ACCESS_TOKEN, FYERS_TOKEN_TIMESTAMP, FYERS_TOKEN_CREATED_AT
+        
+        FYERS_ACCESS_TOKEN = token
+        FYERS_TOKEN_TIMESTAMP = time.time()
+        FYERS_TOKEN_CREATED_AT = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        save_fyers_token_to_json(token, FYERS_TOKEN_TIMESTAMP, FYERS_TOKEN_CREATED_AT)
+        
+        self.is_authenticated = True
+        self.last_relogin_time = 0
+        
+        print("Token updated and saved to JSON file")
+    
+    def authenticate(self, max_retries=3):
+        print("Starting Fyers authentication...", flush=True)
+        
+        print("Attempting to load saved token...", flush=True)
+        if self.load_saved_token():
+            print("Creating Fyers model with saved token...", flush=True)
+            self.fyers_model = fyersModel.FyersModel(
+                client_id=self.client_id,
+                token=self.access_token,
+                log_path=""
+            )
+            
+            try:
+                print("Testing connection with saved token...", flush=True)
+                profile = self.fyers_model.get_profile()
+                if profile['s'] == 'ok':
+                    print("Token is valid and connection successful", flush=True)
+                    self.is_authenticated = True
+                    return True
+                else:
+                    print(f"Token validation failed: {profile}", flush=True)
+                    self.is_authenticated = False
+                    self.send_relogin_message("Token validation failed")
+                    return False
+            except Exception as e:
+                print(f"Connection test failed: {e}", flush=True)
+                self.is_authenticated = False
+                self.send_relogin_message(f"Connection test failed: {str(e)}")
+                return False
+        
+        print("No valid saved token, need fresh authentication", flush=True)
+        
+        for attempt in range(max_retries):
+            print(f"Authentication attempt {attempt + 1}/{max_retries}...", flush=True)
+            try:
+                session = fyersModel.SessionModel(
+                    client_id=self.client_id,
+                    secret_key=self.secret_key,
+                    redirect_uri=self.redirect_uri,
+                    response_type="code",
+                    grant_type="authorization_code"
+                )
+                
+                response = session.generate_authcode()
+                totp_code = self.generate_totp()
+                
+                telegram_message = f"""
+🔐 <b>Fyers Authentication Required</b>
+
+<b>Authorization URL:</b>
+<code>{response}</code>
+
+<b>TOTP Code:</b> <code>{totp_code}</code>
+
+<b>Steps:</b>
+1. Click the URL above
+2. Login with credentials
+3. Send redirect URL back
+
+<b>Timeout:</b> {TELEGRAM_AUTH_TIMEOUT} seconds
+                """
+                
+                print("Sending auth request to Telegram...", flush=True)
+                self.telegram.send_message(telegram_message)
+                
+                print("Waiting for auth code from Telegram...", flush=True)
+                auth_code = self.telegram.wait_for_auth_code()
+                
+                if not auth_code:
+                    print("No auth code received, retrying...", flush=True)
+                    continue
+                
+                print("Auth code received, generating token...", flush=True)
+                session.set_token(auth_code)
+                token_response = session.generate_token()
+                
+                if token_response and token_response.get('s') == 'ok':
+                    print("Token generated successfully!", flush=True)
+                    self.access_token = token_response['access_token']
+                    self.save_token(self.access_token)
+                    
+                    self.fyers_model = fyersModel.FyersModel(
+                        client_id=self.client_id,
+                        token=self.access_token,
+                        log_path=""
+                    )
+                    
+                    self.telegram.send_message("✅ Authentication successful!")
+                    self.is_authenticated = True
+                    return True
+                else:
+                    print(f"Token generation failed: {token_response}", flush=True)
+                    
+            except Exception as e:
+                print(f"Authentication error: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        print("All authentication attempts failed!", flush=True)
+        return False
+    
+    def get_fyers_model(self):
+        if not self.fyers_model:
             if not self.authenticate():
-                return None
-        return self.access_token
+                raise Exception("Authentication failed")
+        return self.fyers_model
 
 # =============================================================================
-# VOLUME SPIKE DETECTOR CLASS
+# GOOGLE SHEETS MANAGER
+# =============================================================================
+
+class GoogleSheetsManager:
+    def __init__(self, detector=None):
+        self.gc = None
+        self.worksheet = None
+        self.lock = threading.Lock()
+        self.detector = detector
+        self.sheets_initialized = self.initialize_sheets()
+        
+        if not self.sheets_initialized:
+            print("Google Sheets initialization failed")
+    
+    def initialize_sheets(self):
+        """Initialize Google Sheets connection"""
+        try:
+            if GOOGLE_CREDENTIALS is None:
+                print("Google credentials not available")
+                return False
+                
+            scope = [
+                "https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive"
+            ]
+            
+            creds = Credentials.from_service_account_info(GOOGLE_CREDENTIALS, scopes=scope)
+            self.gc = gspread.authorize(creds)
+            
+            try:
+                sheet = self.gc.open_by_key(GOOGLE_SHEETS_ID)
+                self.worksheet = sheet.sheet1
+                print(f"Connected to Google Sheet!")
+                
+                try:
+                    headers = self.worksheet.row_values(1)
+                    if not headers or len(headers) < 8:
+                        headers = [
+                            'Date', 'Time', 'Symbol', 'LTP', 'Volume_Spike',
+                            'Trd_Val_Cr', 'Spike_Type', 'Sector'
+                        ]
+                        self.worksheet.insert_row(headers, 1)
+                        print("Added headers to sheet")
+                except:
+                    headers = [
+                        'Date', 'Time', 'Symbol', 'LTP', 'Volume_Spike',
+                        'Trd_Val_Cr', 'Spike_Type', 'Sector'
+                    ]
+                    self.worksheet.append_row(headers)
+                
+            except gspread.SpreadsheetNotFound:
+                print(f"Could not access Google Sheet")
+                return False
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error initializing Google Sheets: {e}")
+            return False
+    
+    def add_trade_to_sheets(self, symbol, ltp, volume_spike, trade_value,
+                           spike_type, previous_volume, current_volume,
+                           previous_ltp=None, ltp_color_format=None):
+        """Add a new trade record to Google Sheets"""
+        try:
+            if self.worksheet is None:
+                return False
+                
+            with self.lock:
+                current_time = datetime.now()
+                sector = get_sector_for_symbol(symbol)
+                
+                row = [
+                    current_time.strftime('%Y-%m-%d'),
+                    current_time.strftime('%H:%M:%S'),
+                    symbol,
+                    round(ltp, 2),
+                    int(volume_spike),
+                    round(trade_value / 10000000, 2),
+                    spike_type,
+                    sector
+                ]
+                
+                self.worksheet.append_row(row)
+                print(f"Added to Google Sheets: {symbol} ({sector}) - Rs{trade_value/10000000:.2f} crore")
+                
+                return True
+                
+        except Exception as e:
+            print(f"Error adding to Google Sheets: {e}")
+            return False
+
+# =============================================================================
+# VOLUME SPIKE DETECTOR
 # =============================================================================
 
 class VolumeSpikeDetector:
     def __init__(self):
         self.authenticator = FyersAuthenticator()
-        self.fyers = None
-        self.worksheet = None
-        self.stop_event = threading.Event()
-        self.telegram_handler = TelegramHandler()
-        self.message_count = 0  # Debug counter for messages received
-        self.last_debug_time = time.time()  # For periodic debug output
+        self.sheets_manager = GoogleSheetsManager(self)
+        self.access_token = None
+        self.fyers_ws = None
+        self.total_ticks = 0
+        self.individual_trades_detected = 0
+        self.start_time = time.time()
+        self.stop_event = None
+        
+        self.previous_volumes = {}
+        self.last_alert_time = {}
+        self.previous_ltp = {}
+        self.sector_counts = {}
+        
+        self.websocket_retry_count = 0
+        self.max_websocket_retries = 1
         
     def initialize(self):
-        """Initialize Fyers and Google Sheets connections"""
+        print("Initializing Volume Spike Detector...", flush=True)
+        
+        print("Attempting authentication...", flush=True)
+        if not self.authenticator.authenticate():
+            print("Authentication failed!", flush=True)
+            return False
+        
+        print("Authentication successful!", flush=True)
+        self.access_token = self.authenticator.access_token
+    
         try:
-            print("[INIT] Starting detector initialization...")
-            print("[INIT] Getting access token...")
-            access_token = self.authenticator.get_access_token()
-            if not access_token:
-                print("[INIT] Failed to get access token")
+            print("Getting Fyers model...", flush=True)
+            fyers = self.authenticator.get_fyers_model()
+            
+            print("Getting profile...", flush=True)
+            profile = fyers.get_profile()
+            
+            if profile['s'] == 'ok':
+                print(f"Connected! User: {profile['data']['name']}", flush=True)
+                return True
+            else:
+                print(f"Profile check failed: {profile}", flush=True)
                 return False
-
-            print(f"[INIT] Access token received: {access_token[:20]}...")
-
-            self.fyers = fyersModel.FyersModel(
-                client_id=self.authenticator.client_id,
-                token=access_token,
-                log_path=""
-            )
-
-            print("[INIT] Fyers client initialized successfully")
-
-            print("[INIT] Initializing Google Sheets...")
-            if not self.initialize_sheets():
-                print("[INIT] Failed to initialize Google Sheets")
-                return False
-
-            print("[INIT] SUCCESS - All initialization complete - ready to start monitoring")
-            return True
-
         except Exception as e:
-            print(f"[INIT] Error during initialization: {e}")
+            print(f"Connection error: {e}", flush=True)
             import traceback
             traceback.print_exc()
             return False
     
-    def initialize_sheets(self):
-        """Initialize Google Sheets connection"""
+    def on_tick_received(self, *args):
         try:
-            if not GOOGLE_CREDENTIALS:
-                print("Google Sheets credentials not available")
-                return False
+            message = args[-1] if args else None
             
-            scopes = ['https://www.googleapis.com/auth/spreadsheets']
-            creds = Credentials.from_service_account_info(GOOGLE_CREDENTIALS, scopes=scopes)
-            client = gspread.authorize(creds)
-            
-            spreadsheet = client.open_by_key(GOOGLE_SHEETS_ID)
-            self.worksheet = spreadsheet.sheet1
-            
-            headers = self.worksheet.row_values(1)
-            if not headers:
-                headers = ['Date', 'Time', 'Symbol', 'LTP', 'Volume_Spike', 'Trd_Val_Cr', 'Spike_Type', 'Sector', 'Symbol_Count', 'Sector_Count']
-                self.worksheet.append_row(headers)
-                print("Created new header row in Google Sheets with correct column name")
-            
-            print("Google Sheets initialized successfully")
-            return True
-            
+            if isinstance(message, dict):
+                if message.get('type') in ['cn', 'ful', 'sub']:
+                    return
+                
+                if 'symbol' in message:
+                    self.detect_individual_trade(message)
+                        
         except Exception as e:
-            print(f"Error initializing Google Sheets: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+            print(f"Error in tick handler: {e}")
     
-    def add_to_sheet(self, data):
-        """Add data to Google Sheets"""
+    def detect_individual_trade(self, tick_data):
+        """Detect individual large trades"""
         try:
-            print(f"\n[DEBUG] add_to_sheet called for {data['symbol']}")
-
-            if not self.worksheet:
-                print("[ERROR] Worksheet not initialized")
-                return False
-
-            print(f"[DEBUG] Worksheet is initialized: {self.worksheet.title}")
-
-            row = [
-                data['date'],
-                data['time'],
-                data['symbol'],
-                data['price'],
-                data['volume'],
-                data['value_crores'],
-                data['type'],
-                data['sector'],
-                '',  # Symbol_Count placeholder
-                ''   # Sector_Count placeholder
-            ]
-
-            print(f"[DEBUG] Preparing to append row: {row}")
-
-            # Use append_row with value_input_option to ensure proper formatting
-            # and table_range to ensure it appends to column A onwards
-            self.worksheet.append_row(row, value_input_option='USER_ENTERED', table_range='A1')
-
-            print(f"[SUCCESS] Added to Google Sheets: {data['symbol']} - Rs{data['value_crores']:.2f} Cr")
-            return True
-
-        except Exception as e:
-            print(f"[ERROR] Failed adding to Google Sheets: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def send_telegram_alert(self, data):
-        """Send alert to Telegram"""
-        try:
-            message = f"""<b>Volume Spike Alert</b>
-
-<b>Symbol:</b> {data['symbol']}
-<b>Sector:</b> {data['sector']}
-<b>Volume:</b> {data['volume']:,}
-<b>Price:</b> Rs{data['price']:.2f}
-<b>Value:</b> Rs{data['value_crores']:.2f} Crores
-<b>Type:</b> {data['type']}
-<b>Time:</b> {data['time']}
-            """
+            self.total_ticks += 1
             
-            return self.telegram_handler.send_message(message)
+            symbol = tick_data.get('symbol', '')
+            ltp = float(tick_data.get('ltp', 0))
+            current_volume = float(tick_data.get('vol_traded_today', 0))
             
-        except Exception as e:
-            print(f"Error sending Telegram alert: {e}")
-            return False
-    
-    def on_message(self, message):
-        """Callback for WebSocket messages"""
-        try:
-            self.message_count += 1
-
-            # Periodic debug output every 10 seconds
-            current_time = time.time()
-            if current_time - self.last_debug_time >= 10:
-                print(f"\n[DEBUG] Messages received so far: {self.message_count}")
-                self.last_debug_time = current_time
-
-            if check_market_end():
-                print("Market ended, stopping monitoring...")
-                self.stop_event.set()
+            if not symbol or ltp <= 0 or current_volume <= 0:
                 return
-
-            # FIXED: Handle the actual Fyers WebSocket data structure
-            # Data comes at root level, not inside 'd' key
-            if not isinstance(message, dict):
-                print(f"[DEBUG] Received non-dict message: {type(message)}")
+            
+            previous_volume = self.previous_volumes.get(symbol, current_volume)
+            previous_ltp = self.previous_ltp.get(symbol, None)
+            
+            volume_spike = current_volume - previous_volume
+            
+            self.previous_volumes[symbol] = current_volume
+            self.previous_ltp[symbol] = ltp
+            
+            if volume_spike <= MIN_VOLUME_SPIKE:
                 return
-
-            # Show first 5 messages to understand structure
-            if self.message_count <= 5:
-                print(f"[DEBUG] Message #{self.message_count}: {message}")
-
-            # Skip control messages (authentication, mode changes, etc.)
-            msg_type = message.get('type', '')
-            if msg_type in ['cn', 'ful', 'sub']:  # Control message types
-                if self.message_count <= 5:
-                    print(f"[DEBUG] Skipping control message type: {msg_type}")
-                return
-
-            # Process symbol data messages (type 'sf' = symbol feed)
-            if msg_type == 'sf' and 'symbol' in message and 'ltp' in message and 'last_traded_qty' in message:
-                symbol = message['symbol']
-                price = message['ltp']
-                volume = message['last_traded_qty']  # FIXED: Use last_traded_qty instead of vol_traded_today
-
-                trade_value = volume * price
-
-                # Debug: Show threshold comparison for first few trades
-                if self.message_count <= 30:
-                    print(f"[DEBUG] {symbol}: last_traded_qty={volume:,}, price={price:.2f}, trade_value={trade_value:.2f}, threshold={INDIVIDUAL_TRADE_THRESHOLD}")
-
-                if trade_value >= INDIVIDUAL_TRADE_THRESHOLD:
-                    print(f"[DEBUG] Threshold met! trade_value={trade_value:.2f} >= threshold={INDIVIDUAL_TRADE_THRESHOLD}")
-
-                    value_crores = trade_value / 10000000
+            
+            individual_trade_value = ltp * volume_spike
+            
+            if individual_trade_value >= INDIVIDUAL_TRADE_THRESHOLD:
+                last_alert = self.last_alert_time.get(symbol, 0)
+                time_since_last = time.time() - last_alert
+                
+                if time_since_last > 60:
+                    self.individual_trades_detected += 1
+                    self.last_alert_time[symbol] = time.time()
+                    
                     sector = get_sector_for_symbol(symbol)
+                    self.sector_counts[sector] = self.sector_counts.get(sector, 0) + 1
+                    
+                    spike_percentage = (volume_spike / previous_volume * 100) if previous_volume > 0 else 0
+                    if spike_percentage > 50:
+                        spike_type = "Large Spike"
+                    elif spike_percentage > 20:
+                        spike_type = "Medium Spike"
+                    else:
+                        spike_type = "Volume Increase"
 
-                    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+                    ltp_change = ltp - previous_ltp if previous_ltp else 0
+                    
+                    print(f"\nLARGE TRADE: {symbol} ({sector}) - Rs{individual_trade_value/10000000:.2f} Cr")
+                    
+                    self.sheets_manager.add_trade_to_sheets(
+                        symbol=symbol,
+                        ltp=ltp,
+                        volume_spike=volume_spike,
+                        trade_value=individual_trade_value,
+                        spike_type=spike_type,
+                        previous_volume=previous_volume,
+                        current_volume=current_volume,
+                        previous_ltp=previous_ltp
+                    )
+                    
+                    telegram_alert = f"""
+<b>🚨 LARGE TRADE DETECTED</b>
 
-                    data = {
-                        'date': now.strftime("%d-%m-%Y"),
-                        'time': now.strftime("%H:%M:%S"),
-                        'symbol': symbol,
-                        'sector': sector,
-                        'volume': volume,
-                        'price': price,
-                        'value_crores': value_crores,
-                        'type': 'Individual Trade'
-                    }
-
-                    print(f"\n{'='*50}")
-                    print(f"VOLUME SPIKE DETECTED!")
-                    print(f"Symbol: {symbol}")
-                    print(f"Sector: {sector}")
-                    print(f"Volume: {volume:,}")
-                    print(f"Price: Rs{price:.2f}")
-                    print(f"Value: Rs{value_crores:.2f} Crores")
-                    print(f"{'='*50}\n")
-
-                    self.add_to_sheet(data)
-                    self.send_telegram_alert(data)
-
+<b>Symbol:</b> {symbol}
+<b>Sector:</b> {sector}
+<b>LTP:</b> Rs{ltp:,.2f}
+<b>Volume:</b> {volume_spike:,.0f}
+<b>Value:</b> Rs{individual_trade_value/10000000:.2f} Cr
+<b>Time:</b> {datetime.now().strftime('%H:%M:%S')}
+                    """
+                    self.authenticator.telegram.send_message(telegram_alert)
+                
         except Exception as e:
-            print(f"Error processing message: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    def on_error(self, error):
-        """Callback for WebSocket errors"""
-        print(f"\n[ERROR] WebSocket Error: {error}")
-        print(f"[ERROR] Error type: {type(error)}")
-        import traceback
-        traceback.print_exc()
-    
-    def on_close(self):
-        """Callback for WebSocket close"""
-        print("WebSocket connection closed")
-    
-    def on_open(self):
-        """Callback for WebSocket open"""
-        print("\n" + "="*60)
-        print("[WEBSOCKET] Connection opened successfully!")
-        print("="*60)
-
-        # FIXED: Changed from "symbolData" to "SymbolUpdate" to match Fyers API v3
-        data_type = "SymbolUpdate"
-        symbols = STOCK_SYMBOLS[:MAX_SYMBOLS]
-
-        print(f"\n[WEBSOCKET] Subscription Details:")
-        print(f"  Data Type: {data_type}")
-        print(f"  Number of symbols: {len(symbols)}")
-        print(f"  First 5 symbols: {symbols[:5]}")
-        print(f"  Last 5 symbols: {symbols[-5:]}")
-
-        print(f"\n[WEBSOCKET] Subscribing to {len(symbols)} symbols...")
-
-        try:
-            self.fyers_ws.subscribe(symbols=symbols, data_type=data_type)
-            print("[WEBSOCKET] Subscription successful!")
-        except Exception as e:
-            print(f"[WEBSOCKET ERROR] Subscription failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-        print(f"\n[WEBSOCKET] Now monitoring {len(symbols)} stocks for volume spikes")
-        print(f"[WEBSOCKET] Threshold: Rs{INDIVIDUAL_TRADE_THRESHOLD/10000000:.2f} Crores (Rs {INDIVIDUAL_TRADE_THRESHOLD:,})")
-        print(f"[WEBSOCKET] Waiting for market data messages...")
-        print("="*60 + "\n")
+            print(f"Error detecting trade: {e}")
     
     def start_monitoring(self):
-        """Start monitoring stocks"""
+        """Start monitoring"""
         try:
-            print("\n" + "="*60)
-            print("[MONITOR] start_monitoring() called - detector starting!")
-            print("="*60)
-
-            wait_for_market_start()
-
-            print("\n[MONITOR] Starting Volume Spike Detector...")
-            print(f"[MONITOR] Market Hours: {MARKET_START_TIME} - {MARKET_END_TIME}")
-            print(f"[MONITOR] Individual Trade Threshold: Rs{INDIVIDUAL_TRADE_THRESHOLD/10000000:.2f} Crores")
-            print(f"[MONITOR] Monitoring {MAX_SYMBOLS} symbols")
-
-            access_token = f"{self.authenticator.client_id}:{self.authenticator.access_token}"
-            print(f"[MONITOR] Using access token: {access_token[:30]}...")
-
-            print("[MONITOR] Creating WebSocket connection...")
+            print("Creating WebSocket connection...")
             self.fyers_ws = data_ws.FyersDataSocket(
-                access_token=access_token,
+                access_token=f"{FYERS_CLIENT_ID}:{self.access_token}",
                 log_path="",
                 litemode=False,
                 write_to_file=False,
                 reconnect=True,
-                on_connect=self.on_open,
-                on_close=self.on_close,
-                on_error=self.on_error,
-                on_message=self.on_message
+                on_message=self.on_tick_received
             )
-
-            print("[MONITOR] Connecting to WebSocket...")
+            
+            symbols_to_monitor = STOCK_SYMBOLS[:MAX_SYMBOLS]
+            print(f"Subscribing to {len(symbols_to_monitor)} symbols...")
+            
             self.fyers_ws.connect()
-            print("[MONITOR] WebSocket connect() called - connection active")
-
-            # Heartbeat to show detector is alive
-            heartbeat_counter = 0
-            while not self.stop_event.is_set():
-                if check_market_end():
-                    print("[MONITOR] Market hours ended, stopping monitoring...")
+            time.sleep(3)
+            self.fyers_ws.subscribe(symbols=symbols_to_monitor, data_type="SymbolUpdate")
+            
+            print("Monitoring started")
+            
+            while True:
+                if self.stop_event and self.stop_event.is_set():
                     break
-
-                # Print heartbeat every 60 seconds
-                heartbeat_counter += 1
-                if heartbeat_counter % 60 == 0:
-                    now = datetime.now(ZoneInfo("Asia/Kolkata"))
-                    print(f"[HEARTBEAT] Detector alive at {now.strftime('%H:%M:%S')} - Messages: {self.message_count}")
-
-                time.sleep(1)
-
-            print("[MONITOR] Closing WebSocket connection...")
+                time.sleep(5)
+                
+        except Exception as e:
+            print(f"Monitoring error: {e}")
+            raise
+        finally:
             if self.fyers_ws:
                 try:
-                    self.fyers_ws.close()
-                    print("[MONITOR] WebSocket connection closed successfully")
-                except Exception as e:
-                    print(f"[MONITOR] Error closing WebSocket: {e}")
-
-        except Exception as e:
-            print(f"[MONITOR] Error in monitoring: {e}")
-            import traceback
-            traceback.print_exc()
+                    self.fyers_ws.close_connection()
+                except:
+                    pass
 
 # =============================================================================
 # MAIN EXECUTION
 # =============================================================================
 
-def start_all_services():
-    """Start both the volume detector and summary scheduler"""
-    print("\n[SERVICES] Starting all services...")
-
+if __name__ == "__main__":
+    import sys
+    
+    # Flush output immediately for better logging
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+    
     try:
-        print("[SERVICES] Creating summary scheduler thread...")
+        print("="*70, flush=True)
+        print("Fyers Volume Spike Detector with Summary", flush=True)
+        print("="*70, flush=True)
+        
+        # Start summary scheduler in background
         summary_thread = threading.Thread(target=summary_scheduler, daemon=True)
         summary_thread.start()
-        print("[SERVICES] Summary scheduler started in background")
-
-        print("[SERVICES] Starting supervisor loop...")
+        print("Summary scheduler started", flush=True)
+        
+        print("\nCommands available:", flush=True)
+        print("   Detector Bot: 'force' or 'restart'", flush=True)
+        print("   Summary Bot: 'send' or 'done'", flush=True)
+        print("\nSupervisor will check for commands every 10 seconds", flush=True)
+        print("="*70, flush=True)
+        
+        print("\nStarting supervisor loop...", flush=True)
         supervisor_loop()
-    except Exception as e:
-        print(f"[SERVICES] Error starting services: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
-
-if __name__ == "__main__":
-    # Force unbuffered output for real-time logs on Render
-    sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
-    sys.stderr.reconfigure(line_buffering=True) if hasattr(sys.stderr, 'reconfigure') else None
-
-    try:
-        print("\n" + "="*60, flush=True)
-        print("FYERS VOLUME SPIKE DETECTOR - STARTUP", flush=True)
-        print("="*60, flush=True)
-        print(f"Python Version: {sys.version}", flush=True)
-        print(f"Current Directory: {os.getcwd()}", flush=True)
-        print(f"Script Path: {os.path.abspath(__file__)}", flush=True)
-        print(f"Platform: {sys.platform}", flush=True)
-
-        # Check critical environment variables
-        print("\n" + "="*60)
-        print("CHECKING ENVIRONMENT VARIABLES")
-        print("="*60)
-
-        env_checks = {
-            'GOOGLE_CREDENTIALS_JSON': os.getenv('GOOGLE_CREDENTIALS_JSON') is not None,
-            'GOOGLE_CLIENT_EMAIL': os.getenv('GOOGLE_CLIENT_EMAIL') is not None,
-            'FYERS_ACCESS_TOKEN': FYERS_ACCESS_TOKEN != '',
-            'TELEGRAM_BOT_TOKEN': TELEGRAM_BOT_TOKEN != '',
-            'GOOGLE_SHEETS_ID': GOOGLE_SHEETS_ID != ''
-        }
-
-        for key, status in env_checks.items():
-            status_str = "OK" if status else "MISSING"
-            print(f"  {key}: [{status_str}]")
-
-        print("\n" + "="*60)
-        print("STARTING SERVICES")
-        print("="*60)
-
-        start_all_services()
-
+            
     except KeyboardInterrupt:
-        print("\n[SHUTDOWN] Shutting down gracefully...")
+        print("\nShutting down...", flush=True)
         _stop_stream_once()
+        sys.exit(0)
     except Exception as e:
-        print(f"\n[FATAL ERROR] {e}")
+        print(f"Fatal error: {e}", flush=True)
         import traceback
         traceback.print_exc()
+        _stop_stream_once()
         sys.exit(1)
-
