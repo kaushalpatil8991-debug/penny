@@ -35,7 +35,7 @@ restart_count = 0
 max_restarts = 5
 last_restart_time = 0
 manual_restart_count = 0
-health_check_url = "https://fyers-volume-spike-detector.onrender.com/health"
+health_check_url = "https://penny-00h7.onrender.com/health"
 last_self_health_check = time.time()
 
 @app.get("/")
@@ -328,3 +328,4 @@ if __name__ == "__main__":
     print("="*70)
     
     uvicorn.run(app, host="0.0.0.0", port=port)
+
