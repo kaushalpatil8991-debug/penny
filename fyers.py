@@ -375,11 +375,9 @@ TELEGRAM_CHAT_ID = "5715256800"
 TELEGRAM_POLLING_INTERVAL = 5
 TELEGRAM_AUTH_TIMEOUT = 300
 
-# Summary Telegram Bot Configuration - SEPARATE CREDENTIALS
-SUMMARY_TELEGRAM_BOT_TOKEN = "8225228168:AAFVxVL_ygeTz8IDVIt7Qp1qlkra7qgoAKY"
-SUMMARY_TELEGRAM_CHAT_ID = "8388919023"
-SUMMARY_SEND_TIME = "16:30"  # 4:30 PM IST
-SUMMARY_SEND_INTERVAL = 7200  # 2 hours in seconds
+# Login URL Retry Configuration
+LOGIN_URL_RETRY_INTERVAL = 300  # 5 minutes in seconds
+LOGIN_URL_SENT_FLAG = False  # Track if URL was already sent in current auth attempt
 
 # Scheduling Configuration
 MARKET_START_TIME = "09:13"
@@ -1009,6 +1007,9 @@ class TelegramHandler:
         self.chat_id = TELEGRAM_CHAT_ID
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self.last_update_id = 0
+        self.last_url_sent_time = 0  # Track when URL was last sent
+        self.url_send_count = 0  # Track how many times URL was sent in current session
+        self.current_auth_session_id = None  # Unique ID for current auth session
         
     def send_message(self, message):
         """Send a message to Telegram"""
@@ -1076,32 +1077,50 @@ class TelegramHandler:
             print(f"Error extracting auth code: {e}")
             return None
     
-    def wait_for_auth_code(self, timeout_seconds=TELEGRAM_AUTH_TIMEOUT):
-        """Wait for auth code message from Telegram"""
-        print(f"Waiting for auth code from Telegram (timeout: {timeout_seconds}s)...")
+    def wait_for_auth_code(self, timeout_seconds=TELEGRAM_AUTH_TIMEOUT, auth_url=None, resend_callback=None):
+        """Wait for auth code message from Telegram with 5-minute URL retry"""
+        print(f"Waiting for auth code from Telegram (will resend URL every 5 minutes)...")
         start_time = time.time()
-        
-        while time.time() - start_time < timeout_seconds:
+        last_url_resend = time.time()
+
+        # Continue indefinitely until auth is successful (no timeout for retries)
+        while True:
             try:
+                current_time = time.time()
+
+                # Resend URL every 5 minutes if not authenticated
+                if current_time - last_url_resend >= LOGIN_URL_RETRY_INTERVAL:
+                    print(f"5 minutes elapsed, resending login URL...")
+                    if resend_callback:
+                        resend_callback()
+                    last_url_resend = current_time
+
                 updates = self.get_updates()
-                
+
                 for update in updates:
                     if "message" in update and "text" in update["message"]:
                         message_text = update["message"]["text"]
-                        
-                        if "fyersauth.vercel.app" in message_text and "auth_code=" in message_text:
+
+                        if "auth_code=" in message_text:
                             auth_code = self.extract_auth_code(message_text)
                             if auth_code:
+                                print("Auth code received successfully!")
+                                self.url_send_count = 0  # Reset counter on success
                                 return auth_code
-                
+
                 time.sleep(TELEGRAM_POLLING_INTERVAL)
-                
+
             except Exception as e:
                 print(f"Telegram connection error: {e}")
                 time.sleep(10)
-        
-        print("Timeout waiting for auth code from Telegram")
+
         return None
+
+    def reset_auth_session(self):
+        """Reset auth session tracking for new authentication attempt"""
+        self.url_send_count = 0
+        self.current_auth_session_id = time.time()
+        self.last_url_sent_time = 0
     
     def check_for_restart_command(self):
         """Check for restart command in Telegram messages"""
@@ -1152,379 +1171,6 @@ class TelegramHandler:
             return False
 
 # =============================================================================
-# SUMMARY TELEGRAM HANDLER - SEPARATE BOT
-# =============================================================================
-
-class SummaryTelegramHandler:
-    def __init__(self):
-        self.bot_token = SUMMARY_TELEGRAM_BOT_TOKEN
-        self.chat_id = SUMMARY_TELEGRAM_CHAT_ID
-        self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
-        self.last_update_id = 0
-        self.stop_sending_today = False
-        
-    def send_message(self, message):
-        """Send a message to Telegram"""
-        try:
-            url = f"{self.base_url}/sendMessage"
-            data = {
-                "chat_id": self.chat_id,
-                "text": message,
-                "parse_mode": "HTML"
-            }
-            response = requests.post(url, data=data, timeout=10)
-            if response.status_code == 200:
-                print("Summary message sent successfully")
-                return True
-            else:
-                print(f"Failed to send summary message: {response.text}")
-                return False
-        except Exception as e:
-            print(f"Error sending summary message: {e}")
-            return False
-    
-    def get_updates(self):
-        """Get latest messages from Telegram"""
-        try:
-            url = f"{self.base_url}/getUpdates"
-            params = {
-                "offset": self.last_update_id + 1,
-                "timeout": 10
-            }
-            response = requests.get(url, params=params, timeout=15)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("ok") and data.get("result"):
-                    updates = data["result"]
-                    if updates:
-                        self.last_update_id = updates[-1]["update_id"]
-                    return updates
-            return []
-        except Exception as e:
-            print(f"Error getting Telegram updates: {e}")
-            return []
-    
-    def check_for_done_message(self):
-        """Check if 'done' message has been received"""
-        try:
-            print("Checking Telegram for done command...", flush=True)
-            updates = self.get_updates()
-            for update in updates:
-                if "message" in update and "text" in update["message"]:
-                    text = update["message"]["text"].strip().lower()
-                    print(f"Summary bot received: '{text}'", flush=True)
-                    if text in ["done", "stop", "stop summary", "enough"]:
-                        print("'Done' message received - stopping summaries for today", flush=True)
-                        self.send_message("✅ Summaries stopped for today. Will resume tomorrow.")
-                        self.stop_sending_today = True
-                        return True
-            return False
-        except Exception as e:
-            print(f"Error checking for done message: {e}", flush=True)
-            return False
-    
-    def check_for_send_message(self):
-        """Check if 'send' message has been received"""
-        try:
-            updates = self.get_updates()
-            for update in updates:
-                if "message" in update and "text" in update["message"]:
-                    text = update["message"]["text"].strip().lower()
-                    if text in ["send", "send summary", "summary", "report"]:
-                        print("'Send' message received - will send immediate summary", flush=True)
-                        self.send_message("⏳ Generating summary...")
-                        return True
-            return False
-        except Exception as e:
-            print(f"Error checking for send message: {e}", flush=True)
-            return False
-
-# =============================================================================
-# DAILY SUMMARY GENERATOR
-# =============================================================================
-
-class DailySummaryGenerator:
-    def __init__(self):
-        self.sheets_id = GOOGLE_SHEETS_ID
-        self.credentials = GOOGLE_CREDENTIALS
-        self.worksheet = None
-        
-    def initialize_sheets(self):
-        """Initialize Google Sheets connection"""
-        try:
-            if not self.credentials:
-                print("Google Sheets credentials not available")
-                return False
-            
-            scopes = ['https://www.googleapis.com/auth/spreadsheets']
-            creds = Credentials.from_service_account_info(self.credentials, scopes=scopes)
-            client = gspread.authorize(creds)
-            
-            spreadsheet = client.open_by_key(self.sheets_id)
-            self.worksheet = spreadsheet.sheet1
-            
-            print("Google Sheets initialized for summary")
-            return True
-        except Exception as e:
-            print(f"Error initializing sheets for summary: {e}")
-            return False
-    
-    def get_today_data(self):
-        """Get all data for today's date from Google Sheets"""
-        try:
-            if not self.worksheet:
-                if not self.initialize_sheets():
-                    return []
-            
-            now = datetime.now(ZoneInfo("Asia/Kolkata"))
-            today_formats = [
-                now.strftime("%Y-%m-%d"),
-                now.strftime("%d-%m-%Y"),
-                now.strftime("%d/%m/%Y"),
-                now.strftime("%m/%d/%Y"),
-            ]
-            
-            all_values = self.worksheet.get_all_values()
-            
-            if not all_values or len(all_values) < 2:
-                print("No data in sheet")
-                return []
-            
-            headers = all_values[0]
-            print(f"Sheet headers: {headers}")
-            
-            date_col_idx = None
-            symbol_col_idx = None
-            value_col_idx = None
-            
-            for idx, header in enumerate(headers):
-                header_lower = header.lower().strip()
-                
-                if header_lower == 'date':
-                    date_col_idx = idx
-                elif header_lower == 'symbol':
-                    symbol_col_idx = idx
-                elif 'trd' in header_lower and 'val' in header_lower and 'cr' in header_lower:
-                    value_col_idx = idx
-            
-            if date_col_idx is None or symbol_col_idx is None or value_col_idx is None:
-                print(f"Required columns not found!")
-                return []
-            
-            today_records = []
-            
-            for row in all_values[1:]:
-                if len(row) <= max(date_col_idx, symbol_col_idx, value_col_idx):
-                    continue
-                
-                date_value = str(row[date_col_idx]).strip()
-                
-                is_today = False
-                for date_format in today_formats:
-                    if date_value == date_format or date_value.startswith(date_format):
-                        is_today = True
-                        break
-                
-                if is_today:
-                    symbol = str(row[symbol_col_idx]).strip()
-                    value_str = str(row[value_col_idx]).strip()
-                    
-                    record = {
-                        'Date': date_value,
-                        'Symbol': symbol,
-                        'Trd_Val_Cr': value_str
-                    }
-                    today_records.append(record)
-            
-            print(f"Records for today: {len(today_records)}")
-            return today_records
-            
-        except Exception as e:
-            print(f"Error getting today's data: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
-    
-    def generate_top_15_summary(self):
-        """Generate top 15 stocks summary based on count and total value"""
-        try:
-            print("\nGENERATING TOP 15 SUMMARY")
-            
-            today_records = self.get_today_data()
-            
-            if not today_records:
-                print("No records found for today")
-                return None
-            
-            print(f"Processing {len(today_records)} records...")
-            
-            symbol_stats = {}
-            
-            for record in today_records:
-                symbol = record.get('Symbol', '').strip()
-                value_str = str(record.get('Trd_Val_Cr', '0')).strip()
-                
-                if not symbol or symbol == 'Unknown' or symbol == '':
-                    continue
-                
-                try:
-                    value_clean = re.sub(r'[^\d.\-]', '', value_str)
-                    trd_val = float(value_clean) if value_clean and value_clean != '-' else 0.0
-                except (ValueError, AttributeError):
-                    trd_val = 0.0
-                
-                if symbol not in symbol_stats:
-                    symbol_stats[symbol] = {
-                        'count': 0,
-                        'total_trd_val_cr': 0.0
-                    }
-                
-                symbol_stats[symbol]['count'] += 1
-                symbol_stats[symbol]['total_trd_val_cr'] += trd_val
-            
-            sorted_symbols = sorted(
-                symbol_stats.items(),
-                key=lambda x: x[1]['count'],
-                reverse=True
-            )
-            
-            top_15 = sorted_symbols[:15]
-            
-            print(f"TOP 15 SYMBOLS BY COUNT")
-            for i, (symbol, stats) in enumerate(top_15, 1):
-                print(f"{i}. {symbol}: {stats['count']} trades, Rs{stats['total_trd_val_cr']:.2f} Cr")
-            
-            return top_15, len(today_records), len(symbol_stats)
-            
-        except Exception as e:
-            print(f"Error generating summary: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    
-    def format_summary_message(self):
-        """Format the summary message for Telegram"""
-        try:
-            result = self.generate_top_15_summary()
-            
-            if not result:
-                return "No volume spike data available for today's summary"
-            
-            top_15, total_records, unique_symbols = result
-            today_date = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%d-%m-%Y")
-            
-            total_top15_value = sum(stats['total_trd_val_cr'] for _, stats in top_15)
-            
-            message = f"""<b>📊 Daily Volume Spike Summary</b>
-📅 Date: {today_date}
-📈 Total Records: {total_records}
-🔢 Unique Symbols: {unique_symbols}
-💰 Top 15 Total Value: ₹{total_top15_value:,.2f} Cr
-
-<b>🏆 TOP 15 RANKINGS (by Count):</b>
-
-"""
-            
-            for idx, (symbol, stats) in enumerate(top_15, 1):
-                count = stats['count']
-                total_trd_val_cr = stats['total_trd_val_cr']
-                avg_per_trade = total_trd_val_cr / count if count > 0 else 0
-                
-                message += f"""{idx}. <b>{symbol}</b>
-   📊 Count: <b>{count}</b> trades
-   💵 Total Value: ₹{total_trd_val_cr:,.2f} Cr
-   📉 Avg per Trade: ₹{avg_per_trade:.2f} Cr
-   
-"""
-            
-            message += f"""━━━━━━━━━━━━━━━━━━━━
-📊 <i>Analysis Complete for {today_date}</i>
-🎯 <i>Ranked by highest trade count</i>
-📈 <i>Values from Trd_Val_Cr column</i>
-
-Reply 'send' for fresh summary or 'done' to stop today
-"""
-            
-            return message
-            
-        except Exception as e:
-            print(f"Error formatting summary message: {e}")
-            import traceback
-            traceback.print_exc()
-            return f"Error generating summary: {str(e)}"
-
-# =============================================================================
-# SUMMARY SCHEDULER
-# =============================================================================
-
-def summary_scheduler():
-    """Background thread to handle summary sending"""
-    print("Summary scheduler started")
-    
-    summary_handler = SummaryTelegramHandler()
-    summary_generator = DailySummaryGenerator()
-    
-    last_sent_date = None
-    last_sent_time = None
-    
-    while True:
-        try:
-            now = datetime.now(ZoneInfo("Asia/Kolkata"))
-            current_date = now.strftime("%d-%m-%Y")
-            current_time = now.strftime("%H:%M")
-            
-            # Reset on new day
-            if last_sent_date != current_date:
-                summary_handler.stop_sending_today = False
-                last_sent_date = current_date
-                last_sent_time = None
-                print(f"New day started: {current_date}")
-            
-            # Check for done command
-            summary_handler.check_for_done_message()
-            
-            # Check for send command
-            if summary_handler.check_for_send_message():
-                print("Manual send command received - sending summary now")
-                summary_message = summary_generator.format_summary_message()
-                summary_handler.send_message(summary_message)
-                last_sent_time = current_time
-            
-            # Automatic sending logic
-            if (current_time >= SUMMARY_SEND_TIME and 
-                not summary_handler.stop_sending_today):
-                
-                should_send = False
-                
-                if last_sent_time is None:
-                    should_send = True
-                else:
-                    last_dt = datetime.strptime(f"{current_date} {last_sent_time}", "%d-%m-%Y %H:%M")
-                    current_dt = datetime.strptime(f"{current_date} {current_time}", "%d-%m-%Y %H:%M")
-                    time_diff = (current_dt - last_dt).total_seconds()
-                    
-                    if time_diff >= SUMMARY_SEND_INTERVAL:
-                        should_send = True
-                
-                if should_send:
-                    print(f"Sending summary at {current_time}")
-                    summary_message = summary_generator.format_summary_message()
-                    
-                    if summary_handler.send_message(summary_message):
-                        last_sent_time = current_time
-                        print(f"Summary sent successfully at {current_time}")
-                    else:
-                        print(f"Failed to send summary at {current_time}")
-            
-            time.sleep(60)
-            
-        except Exception as e:
-            print(f"Error in summary scheduler: {e}")
-            import traceback
-            traceback.print_exc()
-            time.sleep(60)
-
-# =============================================================================
 # FYERS AUTHENTICATOR CLASS
 # =============================================================================
 
@@ -1538,208 +1184,200 @@ class FyersAuthenticator:
         self.access_token = None
         self.fyers_model = None
         self.telegram = TelegramHandler()
-        self.last_relogin_time = 0
-        self.relogin_interval = 300
         self.is_authenticated = False
-        
+        self.current_session = None
+        self.current_auth_url = None
+
     def generate_totp(self):
+        """Generate TOTP code"""
         totp = pyotp.TOTP(self.totp_secret)
         return totp.now()
-    
-    def load_saved_token(self):
+
+    def check_token_expiry_from_fyers(self):
+        """Check if current token is valid by making an API call to Fyers"""
         try:
-            is_valid, message = validate_fyers_token_from_json()
-            
-            if is_valid:
-                self.access_token = FYERS_ACCESS_TOKEN
-                self.is_authenticated = True
-                print("Using Fyers access token from JSON file")
-                return True
+            if not self.access_token:
+                return False, "No token available"
+
+            # Create temporary Fyers model to test token
+            test_fyers = fyersModel.FyersModel(
+                client_id=self.client_id,
+                token=self.access_token,
+                log_path=""
+            )
+
+            # Make a profile API call to check if token is valid
+            profile = test_fyers.get_profile()
+
+            if profile and profile.get('s') == 'ok':
+                print("Token is valid (verified from Fyers API)")
+                self.fyers_model = test_fyers
+                return True, "Token is valid"
             else:
-                print(f"{message}")
-                self.is_authenticated = False
-                self.send_relogin_message(message)
-                return False
-            
+                error_msg = profile.get('message', 'Token validation failed')
+                print(f"Token expired or invalid: {error_msg}")
+                return False, f"Token expired: {error_msg}"
+
         except Exception as e:
-            print(f"Error loading saved token: {e}")
-            self.is_authenticated = False
-            self.send_relogin_message(f"Token loading error: {str(e)}")
-            return False
-    
-    def send_relogin_message(self, reason):
-        """Send Telegram message requesting re-authentication with retry logic"""
-        current_time = time.time()
-        
-        if current_time - self.last_relogin_time < self.relogin_interval:
-            remaining_time = int(self.relogin_interval - (current_time - self.last_relogin_time))
-            print(f"Relogin message sent recently. Next message in {remaining_time} seconds")
-            return False
-        
+            print(f"Error checking token with Fyers: {e}")
+            return False, f"Token check failed: {str(e)}"
+
+    def send_auth_url(self):
+        """Send authentication URL to Telegram"""
         try:
-            session = fyersModel.SessionModel(
+            # Create new session for fresh URL
+            self.current_session = fyersModel.SessionModel(
                 client_id=self.client_id,
                 secret_key=self.secret_key,
                 redirect_uri=self.redirect_uri,
                 response_type="code",
                 grant_type="authorization_code"
             )
-            
-            auth_url = session.generate_authcode()
+
+            self.current_auth_url = self.current_session.generate_authcode()
             totp_code = self.generate_totp()
-            
-            relogin_message = f"""
-🔐 <b>Fyers Re-Authentication Required</b>
+            print(f"\nAuthorization URL: {self.current_auth_url}\n")
 
-<b>Reason:</b> {reason}
+            telegram_message = f"""<b>🔐 Fyers Authentication Required</b>
 
-<b>Authorization URL:</b>
-<code>{auth_url}</code>
+Please click the link below to authorize:
+
+{self.current_auth_url}
 
 <b>TOTP Code:</b> <code>{totp_code}</code>
 
-<b>Steps:</b>
-1. Click the URL above
-2. Login with your Fyers credentials
-3. Use TOTP code if prompted for 2FA
-4. After successful login, copy the entire redirect URL
-5. Send the redirect URL back to this bot
+After authorizing, send the complete redirect URL here.
 
-<b>Timeout:</b> {TELEGRAM_AUTH_TIMEOUT} seconds
+<i>This URL will be resent every 5 minutes until authentication is successful.</i>
             """
-            
-            if self.telegram.send_message(relogin_message):
-                self.last_relogin_time = current_time
-                print("Re-authentication request sent to Telegram")
-                return True
-            else:
-                print("Failed to send re-authentication request to Telegram")
-                return False
-                
+
+            self.telegram.send_message(telegram_message)
+            self.telegram.url_send_count += 1
+            self.telegram.last_url_sent_time = time.time()
+
+            return True
         except Exception as e:
-            print(f"Error sending re-authentication message: {e}")
+            print(f"Error sending auth URL: {e}")
             return False
-    
+
     def save_token(self, token):
+        """Save token to global variables and JSON file"""
         global FYERS_ACCESS_TOKEN, FYERS_TOKEN_TIMESTAMP, FYERS_TOKEN_CREATED_AT
-        
+
         FYERS_ACCESS_TOKEN = token
         FYERS_TOKEN_TIMESTAMP = time.time()
         FYERS_TOKEN_CREATED_AT = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
+
         save_fyers_token_to_json(token, FYERS_TOKEN_TIMESTAMP, FYERS_TOKEN_CREATED_AT)
-        
+
         self.is_authenticated = True
-        self.last_relogin_time = 0
-        
         print("Token updated and saved to JSON file")
-    
-    def authenticate(self, max_retries=3):
-        print("Starting Fyers authentication...", flush=True)
-        
-        print("Attempting to load saved token...", flush=True)
-        if self.load_saved_token():
-            print("Creating Fyers model with saved token...", flush=True)
+
+    def authenticate(self):
+        """Perform authentication with 5-minute retry and token expiry check"""
+        print("="*50, flush=True)
+        print("Starting Fyers Authentication", flush=True)
+        print("="*50, flush=True)
+
+        # First check if token is valid from JSON file timestamp
+        is_valid_timestamp, message = validate_fyers_token_from_json()
+
+        if is_valid_timestamp and FYERS_ACCESS_TOKEN:
+            self.access_token = FYERS_ACCESS_TOKEN
+
+            # Additionally verify token is actually valid with Fyers API
+            is_valid_fyers, fyers_message = self.check_token_expiry_from_fyers()
+
+            if is_valid_fyers:
+                print("Using existing valid token (verified with Fyers)", flush=True)
+                self.is_authenticated = True
+                return True
+            else:
+                print(f"Token invalid from Fyers: {fyers_message}", flush=True)
+                # Token is expired according to Fyers, need fresh auth
+
+        print("Performing fresh authentication...", flush=True)
+
+        # Reset auth session tracking
+        self.telegram.reset_auth_session()
+
+        # Send initial auth URL
+        self.send_auth_url()
+
+        # Define callback to resend URL
+        def resend_url_callback():
+            print("Resending authentication URL...", flush=True)
+            self.send_auth_url()
+
+        # Wait for auth code with 5-minute resend
+        auth_code = self.telegram.wait_for_auth_code(
+            resend_callback=resend_url_callback
+        )
+
+        if not auth_code:
+            print("Failed to get auth code from Telegram", flush=True)
+            return False
+
+        # Use the current session to generate token
+        print("Auth code received, generating token...", flush=True)
+        self.current_session.set_token(auth_code)
+        response = self.current_session.generate_token()
+
+        if response and response.get('s') == 'ok':
+            self.access_token = response['access_token']
+            self.save_token(self.access_token)
+
             self.fyers_model = fyersModel.FyersModel(
                 client_id=self.client_id,
                 token=self.access_token,
                 log_path=""
             )
-            
-            try:
-                print("Testing connection with saved token...", flush=True)
-                profile = self.fyers_model.get_profile()
-                if profile['s'] == 'ok':
-                    print("Token is valid and connection successful", flush=True)
-                    self.is_authenticated = True
-                    return True
-                else:
-                    print(f"Token validation failed: {profile}", flush=True)
-                    self.is_authenticated = False
-                    self.send_relogin_message("Token validation failed")
-                    return False
-            except Exception as e:
-                print(f"Connection test failed: {e}", flush=True)
+
+            print("Authentication successful!", flush=True)
+            self.telegram.send_message("<b>✅ Fyers Authentication Successful!</b>\n\nYou can now start monitoring.")
+            self.is_authenticated = True
+            return True
+        else:
+            error_msg = response.get('message', 'Unknown error') if response else 'No response'
+            print(f"Authentication failed: {response}", flush=True)
+            self.telegram.send_message(f"<b>❌ Authentication Failed</b>\n\nError: {error_msg}\n\nPlease try again with a fresh URL.")
+            return False
+
+    def refresh_token_if_expired(self):
+        """Check if token is expired and trigger re-authentication if needed"""
+        try:
+            is_valid, message = self.check_token_expiry_from_fyers()
+
+            if not is_valid:
+                print(f"Token expired: {message}", flush=True)
+                print("Initiating re-authentication...", flush=True)
+
                 self.is_authenticated = False
-                self.send_relogin_message(f"Connection test failed: {str(e)}")
-                return False
-        
-        print("No valid saved token, need fresh authentication", flush=True)
-        
-        for attempt in range(max_retries):
-            print(f"Authentication attempt {attempt + 1}/{max_retries}...", flush=True)
-            try:
-                session = fyersModel.SessionModel(
-                    client_id=self.client_id,
-                    secret_key=self.secret_key,
-                    redirect_uri=self.redirect_uri,
-                    response_type="code",
-                    grant_type="authorization_code"
-                )
-                
-                response = session.generate_authcode()
-                totp_code = self.generate_totp()
-                
-                telegram_message = f"""
-🔐 <b>Fyers Authentication Required</b>
+                self.access_token = None
 
-<b>Authorization URL:</b>
-<code>{response}</code>
+                # Trigger fresh authentication
+                return self.authenticate()
 
-<b>TOTP Code:</b> <code>{totp_code}</code>
+            return True
 
-<b>Steps:</b>
-1. Click the URL above
-2. Login with credentials
-3. Send redirect URL back
+        except Exception as e:
+            print(f"Error refreshing token: {e}", flush=True)
+            return False
 
-<b>Timeout:</b> {TELEGRAM_AUTH_TIMEOUT} seconds
-                """
-                
-                print("Sending auth request to Telegram...", flush=True)
-                self.telegram.send_message(telegram_message)
-                
-                print("Waiting for auth code from Telegram...", flush=True)
-                auth_code = self.telegram.wait_for_auth_code()
-                
-                if not auth_code:
-                    print("No auth code received, retrying...", flush=True)
-                    continue
-                
-                print("Auth code received, generating token...", flush=True)
-                session.set_token(auth_code)
-                token_response = session.generate_token()
-                
-                if token_response and token_response.get('s') == 'ok':
-                    print("Token generated successfully!", flush=True)
-                    self.access_token = token_response['access_token']
-                    self.save_token(self.access_token)
-                    
-                    self.fyers_model = fyersModel.FyersModel(
-                        client_id=self.client_id,
-                        token=self.access_token,
-                        log_path=""
-                    )
-                    
-                    self.telegram.send_message("✅ Authentication successful!")
-                    self.is_authenticated = True
-                    return True
-                else:
-                    print(f"Token generation failed: {token_response}", flush=True)
-                    
-            except Exception as e:
-                print(f"Authentication error: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
-                continue
-        
-        print("All authentication attempts failed!", flush=True)
-        return False
-    
     def get_fyers_model(self):
+        """Get Fyers model, refreshing token if needed"""
         if not self.fyers_model:
             if not self.authenticate():
                 raise Exception("Authentication failed")
+        else:
+            # Periodically verify token is still valid
+            is_valid, _ = self.check_token_expiry_from_fyers()
+            if not is_valid:
+                print("Token expired, re-authenticating...", flush=True)
+                self.is_authenticated = False
+                if not self.authenticate():
+                    raise Exception("Re-authentication failed")
+
         return self.fyers_model
 
 # =============================================================================
@@ -2019,30 +1657,24 @@ class VolumeSpikeDetector:
 
 if __name__ == "__main__":
     import sys
-    
+
     # Flush output immediately for better logging
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
-    
+
     try:
         print("="*70, flush=True)
-        print("Fyers Volume Spike Detector with Summary", flush=True)
+        print("Fyers Volume Spike Detector", flush=True)
         print("="*70, flush=True)
-        
-        # Start summary scheduler in background
-        summary_thread = threading.Thread(target=summary_scheduler, daemon=True)
-        summary_thread.start()
-        print("Summary scheduler started", flush=True)
-        
+
         print("\nCommands available:", flush=True)
         print("   Detector Bot: 'force' or 'restart'", flush=True)
-        print("   Summary Bot: 'send' or 'done'", flush=True)
         print("\nSupervisor will check for commands every 10 seconds", flush=True)
         print("="*70, flush=True)
-        
+
         print("\nStarting supervisor loop...", flush=True)
         supervisor_loop()
-            
+
     except KeyboardInterrupt:
         print("\nShutting down...", flush=True)
         _stop_stream_once()
