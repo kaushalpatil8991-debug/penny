@@ -58,13 +58,13 @@ _stop_event = threading.Event()
 # RUN CONTROLLER FUNCTIONS
 # =============================================================================
 
-def _start_stream_once():
+def _start_stream_once(app_state=None):
     """Start your Fyers WebSocket loop exactly once."""
     global _running_flag, _stop_event
     if _running_flag:
         return False
     _stop_event.clear()
-    threading.Thread(target=_stream_worker, args=(_stop_event,), daemon=True).start()
+    threading.Thread(target=_stream_worker, args=(_stop_event, app_state), daemon=True).start()
     _running_flag = True
     print("Stream STARTED")
     return True
@@ -80,13 +80,16 @@ def _stop_stream_once():
     print("Stream STOPPED")
     return False
 
-def _stream_worker(stop_event: threading.Event):
+def _stream_worker(stop_event: threading.Event, app_state=None):
     """Simplified worker that runs the detector with proper error handling"""
+    global _running_flag
     try:
         print("Starting detector stream worker (single attempt)", flush=True)
-        detector = VolumeSpikeDetector()
+        detector = VolumeSpikeDetector(app_state=app_state)
         detector.stop_event = stop_event
-        
+        if app_state:
+            app_state.set_detector(detector)
+
         print("Initializing detector...", flush=True)
         if detector.initialize():
             print("Detector initialized successfully", flush=True)
@@ -96,167 +99,90 @@ def _stream_worker(stop_event: threading.Event):
         else:
             print("Detector initialization failed - exiting", flush=True)
             return
-            
+
     except Exception as e:
         print(f"Stream worker error: {e}", flush=True)
         import traceback
         traceback.print_exc()
         print("Stream worker exiting due to error", flush=True)
         return
-    
-    print("Stream worker stopped", flush=True)
+    finally:
+        _running_flag = False
+        print("Stream worker stopped", flush=True)
 
 def _inside_window_ist() -> bool:
     """Check if current IST time is within market hours."""
-    # Check if force start flag is set
-    import builtins
-    if hasattr(builtins, 'FORCE_START') and builtins.FORCE_START:
-        return True  # Always return True when forced
-    
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     hhmm = now.strftime("%H:%M")
     return MARKET_START_TIME <= hhmm < MARKET_END_TIME
 
-def supervisor_loop():
-    """Simplified supervisor that manages the detector lifecycle"""
+def supervisor_loop(app_state=None):
+    """Supervisor that manages the detector lifecycle."""
     print("Supervisor loop started", flush=True)
     detector = None
     last_auth_check = time.time()
-    last_command_check = time.time()
     AUTH_CHECK_INTERVAL = 3600
-    COMMAND_CHECK_INTERVAL = 3  # Check for commands every 10 seconds
-    
-    # Create telegram handler for checking commands
-    telegram = TelegramHandler()
-    
+    notified_outside_hours = False
+
+    telegram = TelegramHandler(app_state=app_state)
+
     while True:
         try:
             current_time = time.time()
-            
-            # Check for force/restart commands periodically
-            if current_time - last_command_check > COMMAND_CHECK_INTERVAL:
-                print("[SUPERVISOR] Checking for commands...", flush=True)
-                
-                # Check for force command
-                if telegram.check_for_force_command():
-                    print("[SUPERVISOR] Force command detected! Setting FORCE_START flag", flush=True)
-                    telegram.send_message("🚀 <b>Force Start Initiated</b>\n\n⏳ Bypassing market hours...\n📊 Starting detector immediately...")
-                    import builtins
-                    builtins.FORCE_START = True
-                
-                # Check for restart command
-                if telegram.check_for_restart_command():
-                    print("[SUPERVISOR] Restart command detected! Restarting detector only...", flush=True)
-                    
-                    # Send status message
-                    telegram.send_message("🔄 <b>Restarting Detector...</b>\n\n⏳ Stopping current detector process...")
-                    
-                    # Stop only the detector, not the summary scheduler
-                    _stop_stream_once()
-                    detector = None
-                    
-                    telegram.send_message("✅ Detector stopped\n⏳ Starting fresh detector instance...")
-                    
-                    time.sleep(2)
-                    
-                    # Create new detector instance
-                    try:
-                        detector = VolumeSpikeDetector()
-                        telegram.send_message("🔧 Detector instance created\n⏳ Initializing...")
-                        
-                        _start_stream_once()
-                        
-                        telegram.send_message("✅ <b>Detector Restarted Successfully!</b>\n\n📊 Status: Monitoring active\n⏰ Time: " + datetime.now().strftime('%H:%M:%S'))
-                        print("[SUPERVISOR] Detector restarted successfully", flush=True)
-                        
-                    except Exception as restart_error:
-                        error_msg = f"❌ <b>Restart Failed</b>\n\nError: {str(restart_error)}\n\nPlease try again or check logs."
-                        telegram.send_message(error_msg)
-                        print(f"[SUPERVISOR] Restart error: {restart_error}", flush=True)
-                    
-                    # Continue to next iteration
-                    last_command_check = current_time
-                    continue
-                
-                last_command_check = current_time
-            
-            # Check if we're in market hours
+
+            # Check if we're in market hours (force flag bypasses)
             in_window = _inside_window_ist()
-            
+            if app_state and app_state.force_start:
+                in_window = True
+
             if SCHEDULING_ENABLED and not in_window:
                 if detector:
                     print("Outside market hours, stopping detector...", flush=True)
                     _stop_stream_once()
                     detector = None
-                # Don't spam logs, only print occasionally
-                if int(current_time) % 300 == 0:  # Every 5 minutes
-                    print("Waiting for market hours (or send 'force' command)...", flush=True)
-                time.sleep(60)
+                if not notified_outside_hours:
+                    telegram.send_message("<b>Outside Market Hours</b>\n\nWaiting for market to open.\nSend <b>force</b> to start manually.")
+                    notified_outside_hours = True
+                    print("Outside market hours, waiting...", flush=True)
+                # Sleep 60s but wake instantly on force
+                if app_state:
+                    app_state.force_event.wait(timeout=60)
+                    app_state.force_event.clear()
+                else:
+                    time.sleep(60)
                 continue
-            
-            # We should be running - start detector if not running
+
+            notified_outside_hours = False
+
+            # Start detector if not running
             if not detector or not _running_flag:
                 print("Starting detector...", flush=True)
                 _stop_stream_once()
                 time.sleep(2)
-                
+
                 try:
-                    detector = VolumeSpikeDetector()
-                    print("Detector instance created, starting stream...", flush=True)
-                    _start_stream_once()
+                    _start_stream_once(app_state=app_state)
+                    detector = True
                     print("Stream started successfully", flush=True)
-                    
-                    # Send connection status to user after successful start
-                    try:
-                        # Wait a moment for initialization to complete
-                        time.sleep(3)
-                        
-                        # Check if detector is actually running and authenticated
-                        if detector and hasattr(detector, 'authenticator') and detector.authenticator.is_authenticated:
-                            # Get user info if available
-                            user_name = "Unknown"
-                            try:
-                                if detector.authenticator.fyers_model:
-                                    profile = detector.authenticator.fyers_model.get_profile()
-                                    if profile.get('s') == 'ok':
-                                        user_name = profile['data']['name']
-                            except:
-                                pass
-                            
-                            connection_msg = f"""✅ <b>Detector Connected Successfully!</b>
 
-👤 <b>User:</b> {user_name}
-📊 <b>Status:</b> Monitoring Active
-🎯 <b>Symbols:</b> {len(STOCK_SYMBOLS)} stocks
-💰 <b>Threshold:</b> Rs {INDIVIDUAL_TRADE_THRESHOLD/10000000:.1f} Cr
-⏰ <b>Started:</b> {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}
-
-🔔 You will receive alerts for large volume spikes!"""
-                            
-                            telegram.send_message(connection_msg)
-                            print("Connection status sent to user", flush=True)
-                            
-                    except Exception as msg_error:
-                        print(f"Could not send connection message: {msg_error}", flush=True)
-                        
                 except Exception as start_error:
                     print(f"Error starting detector: {start_error}", flush=True)
-                    telegram.send_message(f"❌ <b>Detector Start Failed</b>\n\nError: {str(start_error)}\n\nWill retry in 30 seconds...")
+                    telegram.send_message(f"<b>Detector Start Failed</b>\n\nError: {str(start_error)}\n\nWill retry in 30 seconds...")
                     time.sleep(30)
-                
+
             # Periodic auth check (every hour)
             if current_time - last_auth_check > AUTH_CHECK_INTERVAL:
                 print("Performing periodic auth check...", flush=True)
-                if detector and hasattr(detector, 'authenticator'):
-                    if not detector.authenticator.is_authenticated:
+                det = app_state.get_detector() if app_state else None
+                if det and hasattr(det, 'authenticator'):
+                    if not det.authenticator.is_authenticated:
                         print("Auth expired, will re-authenticate on next cycle", flush=True)
                         _stop_stream_once()
                         detector = None
                 last_auth_check = current_time
-            
-            # Sleep before next check
-            time.sleep(5)  # Check more frequently
-            
+
+            time.sleep(5)
+
         except Exception as e:
             print(f"Supervisor error: {e}", flush=True)
             import traceback
@@ -372,12 +298,7 @@ def save_fyers_token_to_json(access_token, timestamp=None, created_at=None):
 # Telegram Configuration - For Detector
 TELEGRAM_BOT_TOKEN = "8564259065:AAGM5clL_pOagSAEiNURB0ltu1E0yvdC-4Q"
 TELEGRAM_CHAT_ID = "8388919023"
-TELEGRAM_POLLING_INTERVAL = 5
-TELEGRAM_AUTH_TIMEOUT = 300
-
-# Login URL Retry Configuration
-LOGIN_URL_RETRY_INTERVAL = 300  # 5 minutes in seconds
-LOGIN_URL_SENT_FLAG = False  # Track if URL was already sent in current auth attempt
+TELEGRAM_AUTH_TIMEOUT = 600  # 10 minutes webhook wait
 
 # Scheduling Configuration
 MARKET_START_TIME = "09:13"
@@ -1002,15 +923,12 @@ MAX_SYMBOLS = len(STOCK_SYMBOLS)
 # =============================================================================
 
 class TelegramHandler:
-    def __init__(self):
+    def __init__(self, app_state=None):
         self.bot_token = TELEGRAM_BOT_TOKEN
         self.chat_id = TELEGRAM_CHAT_ID
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
-        self.last_update_id = 0
-        self.last_url_sent_time = 0  # Track when URL was last sent
-        self.url_send_count = 0  # Track how many times URL was sent in current session
-        self.current_auth_session_id = None  # Unique ID for current auth session
-        
+        self.app_state = app_state
+
     def send_message(self, message):
         """Send a message to Telegram"""
         try:
@@ -1021,39 +939,15 @@ class TelegramHandler:
                 "parse_mode": "HTML"
             }
             response = requests.post(url, data=data, timeout=10)
-            return response.status_code == 200
+            result = response.json()
+            if not result.get("ok"):
+                print(f"[TELEGRAM] Send failed: {result}")
+                return False
+            return True
         except Exception as e:
-            print(f"Error sending Telegram message: {e}")
+            print(f"[TELEGRAM] Error: {e}")
             return False
-    
-    def get_updates(self):
-        """Get latest messages from Telegram"""
-        try:
-            url = f"{self.base_url}/getUpdates"
-            params = {
-                "offset": self.last_update_id + 1,
-                "timeout": 30
-            }
-            response = requests.get(url, params=params, timeout=35)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("ok") and data.get("result"):
-                    updates = data["result"]
-                    if updates:
-                        self.last_update_id = updates[-1]["update_id"]
-                        print(f"[TELEGRAM] Received {len(updates)} updates, last ID: {self.last_update_id}", flush=True)
-                    return updates
-                else:
-                    print(f"[TELEGRAM] Response OK but no results: {data}", flush=True)
-            else:
-                print(f"[TELEGRAM] Bad response: {response.status_code}", flush=True)
-            
-            return []
-        except Exception as e:
-            print(f"[TELEGRAM] Error getting updates: {e}", flush=True)
-            return []
-    
+
     def extract_auth_code(self, message_text):
         """Extract auth_code from Fyers redirect URL using regex"""
         try:
@@ -1063,119 +957,59 @@ class TelegramHandler:
                 auth_code = match1.group(1)
                 print(f"Auth code extracted (with state=None): {auth_code[:20]}...")
                 return auth_code
-            
+
             pattern2 = r'auth_code=([^&\s]+)'
             match2 = re.search(pattern2, message_text)
             if match2:
                 auth_code = match2.group(1)
                 print(f"Auth code extracted (general pattern): {auth_code[:20]}...")
                 return auth_code
-            
+
             print("No auth_code found in message")
             return None
         except Exception as e:
             print(f"Error extracting auth code: {e}")
             return None
-    
-    def wait_for_auth_code(self, timeout_seconds=TELEGRAM_AUTH_TIMEOUT, auth_url=None, resend_callback=None):
-        """Wait for auth code message from Telegram with 5-minute URL retry"""
-        print(f"Waiting for auth code from Telegram (will resend URL every 5 minutes)...")
-        start_time = time.time()
-        last_url_resend = time.time()
 
-        # Continue indefinitely until auth is successful (no timeout for retries)
-        while True:
-            try:
-                current_time = time.time()
+    def wait_for_auth_code(self, timeout=600, resend_interval=300, resend_callback=None):
+        """Wait for auth code via webhook, resending auth URL every resend_interval seconds."""
+        if not self.app_state:
+            print("ERROR: No app_state configured, cannot wait for webhook auth code")
+            return None
 
-                # Resend URL every 5 minutes if not authenticated
-                if current_time - last_url_resend >= LOGIN_URL_RETRY_INTERVAL:
-                    print(f"5 minutes elapsed, resending login URL...")
-                    if resend_callback:
-                        resend_callback()
-                    last_url_resend = current_time
+        print(f"Waiting for auth code via webhook (resend every {resend_interval}s, max {timeout}s)...", flush=True)
+        elapsed = 0
 
-                updates = self.get_updates()
+        while elapsed < timeout:
+            wait_time = min(resend_interval, timeout - elapsed)
+            got_it = self.app_state.auth_code_event.wait(timeout=wait_time)
 
-                for update in updates:
-                    if "message" in update and "text" in update["message"]:
-                        message_text = update["message"]["text"]
+            if got_it:
+                # Auth code arrived - consume it
+                with self.app_state.auth_code_lock:
+                    code = self.app_state.auth_code_value
+                    self.app_state.auth_code_value = None
+                    self.app_state.auth_code_event.clear()
+                if code:
+                    print("Auth code received via webhook!", flush=True)
+                    return code
 
-                        if "auth_code=" in message_text:
-                            auth_code = self.extract_auth_code(message_text)
-                            if auth_code:
-                                print("Auth code received successfully!")
-                                self.url_send_count = 0  # Reset counter on success
-                                return auth_code
+            elapsed += wait_time
 
-                time.sleep(TELEGRAM_POLLING_INTERVAL)
+            # Resend URL if we still have time left
+            if elapsed < timeout and resend_callback:
+                print(f"No auth code yet ({int(elapsed)}s elapsed). Resending auth URL...", flush=True)
+                resend_callback()
 
-            except Exception as e:
-                print(f"Telegram connection error: {e}")
-                time.sleep(10)
-
+        print("Auth code wait timed out", flush=True)
         return None
-
-    def reset_auth_session(self):
-        """Reset auth session tracking for new authentication attempt"""
-        self.url_send_count = 0
-        self.current_auth_session_id = time.time()
-        self.last_url_sent_time = 0
-    
-    def check_for_restart_command(self):
-        """Check for restart command in Telegram messages"""
-        try:
-            print("Checking Telegram for restart command...", flush=True)
-            updates = self.get_updates()
-            
-            for update in updates:
-                if "message" in update and "text" in update["message"]:
-                    message_text = update["message"]["text"].strip()
-                    print(f"Received message: '{message_text}'", flush=True)
-                    
-                    # Check various forms of restart command (case insensitive)
-                    if message_text.lower() in ["restart", "restart!", "restart.", "restart bot", "restart system", "reboot"]:
-                        print(f"Restart command received: '{message_text}'", flush=True)
-                        self.send_message("Restart command received! Initiating restart...")
-                        return True
-            
-            return False
-        except Exception as e:
-            print(f"Error checking for restart command: {e}", flush=True)
-            return False
-
-    def check_for_force_command(self):
-        """Check for Force command in Telegram messages"""
-        try:
-            print("Checking Telegram for force command...", flush=True)
-            updates = self.get_updates()
-            print(f"Got {len(updates)} Telegram updates", flush=True)
-            
-            for update in updates:
-                if "message" in update and "text" in update["message"]:
-                    message_text = update["message"]["text"].strip()
-                    print(f"Received message: '{message_text}'", flush=True)
-                    
-                    # Check various forms of force command (case insensitive)
-                    if message_text.lower() in ["force", "start", "start now"]:
-                        print(f"Force command detected: '{message_text}'", flush=True)
-                        self.send_message("Force command received! Starting detector immediately, bypassing market hours.")
-                        return True
-            
-            print("No force command found in messages", flush=True)
-            return False
-        except Exception as e:
-            print(f"Error checking for Force command: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            return False
 
 # =============================================================================
 # FYERS AUTHENTICATOR CLASS
 # =============================================================================
 
 class FyersAuthenticator:
-    def __init__(self):
+    def __init__(self, app_state=None):
         self.client_id = FYERS_CLIENT_ID
         self.secret_key = FYERS_SECRET_KEY
         self.redirect_uri = FYERS_REDIRECT_URI
@@ -1183,7 +1017,8 @@ class FyersAuthenticator:
         self.pin = FYERS_PIN
         self.access_token = None
         self.fyers_model = None
-        self.telegram = TelegramHandler()
+        self.telegram = TelegramHandler(app_state=app_state)
+        self.app_state = app_state
         self.is_authenticated = False
         self.current_session = None
         self.current_auth_url = None
@@ -1238,7 +1073,7 @@ class FyersAuthenticator:
             totp_code = self.generate_totp()
             print(f"\nAuthorization URL: {self.current_auth_url}\n")
 
-            telegram_message = f"""<b>🔐 Fyers Authentication Required</b>
+            telegram_message = f"""<b>Fyers Authentication Required</b>
 
 Please click the link below to authorize:
 
@@ -1246,15 +1081,11 @@ Please click the link below to authorize:
 
 <b>TOTP Code:</b> <code>{totp_code}</code>
 
-After authorizing, send the complete redirect URL here.
+After authorizing, paste the complete redirect URL in this chat.
 
-<i>This URL will be resent every 5 minutes until authentication is successful.</i>
-            """
+<i>URL will be resent every 5 minutes with a fresh TOTP.</i>"""
 
             self.telegram.send_message(telegram_message)
-            self.telegram.url_send_count += 1
-            self.telegram.last_url_sent_time = time.time()
-
             return True
         except Exception as e:
             print(f"Error sending auth URL: {e}")
@@ -1274,7 +1105,7 @@ After authorizing, send the complete redirect URL here.
         print("Token updated and saved to JSON file")
 
     def authenticate(self):
-        """Perform authentication with 5-minute retry and token expiry check"""
+        """Perform authentication - sends URL once, waits for auth code via webhook."""
         print("="*50, flush=True)
         print("Starting Fyers Authentication", flush=True)
         print("="*50, flush=True)
@@ -1290,32 +1121,31 @@ After authorizing, send the complete redirect URL here.
 
             if is_valid_fyers:
                 print("Using existing valid token (verified with Fyers)", flush=True)
+                self.telegram.send_message("<b>Token Valid</b>\n\nUsing existing token. Monitoring will start now.")
                 self.is_authenticated = True
                 return True
             else:
                 print(f"Token invalid from Fyers: {fyers_message}", flush=True)
-                # Token is expired according to Fyers, need fresh auth
 
         print("Performing fresh authentication...", flush=True)
 
-        # Reset auth session tracking
-        self.telegram.reset_auth_session()
+        # Clear the event before sending URL (prevents race condition)
+        if self.app_state:
+            self.app_state.auth_code_event.clear()
 
         # Send initial auth URL
         self.send_auth_url()
 
-        # Define callback to resend URL
-        def resend_url_callback():
-            print("Resending authentication URL...", flush=True)
-            self.send_auth_url()
-
-        # Wait for auth code with 5-minute resend
+        # Wait for auth code via webhook, resend URL every 5 min if no response
         auth_code = self.telegram.wait_for_auth_code(
-            resend_callback=resend_url_callback
+            timeout=1800,           # 30 min overall max
+            resend_interval=300,    # resend every 5 min
+            resend_callback=self.send_auth_url
         )
 
         if not auth_code:
-            print("Failed to get auth code from Telegram", flush=True)
+            print("Auth code not received within timeout", flush=True)
+            self.telegram.send_message("<b>Auth timed out.</b>\nSend /restart to try again.")
             return False
 
         # Use the current session to generate token
@@ -1334,13 +1164,13 @@ After authorizing, send the complete redirect URL here.
             )
 
             print("Authentication successful!", flush=True)
-            self.telegram.send_message("<b>✅ Fyers Authentication Successful!</b>\n\nYou can now start monitoring.")
+            self.telegram.send_message("<b>Fyers Authentication Successful!</b>\n\nMonitoring will start now.")
             self.is_authenticated = True
             return True
         else:
             error_msg = response.get('message', 'Unknown error') if response else 'No response'
             print(f"Authentication failed: {response}", flush=True)
-            self.telegram.send_message(f"<b>❌ Authentication Failed</b>\n\nError: {error_msg}\n\nPlease try again with a fresh URL.")
+            self.telegram.send_message(f"<b>Authentication Failed</b>\n\nError: {error_msg}\n\nSend /restart to try again.")
             return False
 
     def refresh_token_if_expired(self):
@@ -1478,8 +1308,9 @@ class GoogleSheetsManager:
 # =============================================================================
 
 class VolumeSpikeDetector:
-    def __init__(self):
-        self.authenticator = FyersAuthenticator()
+    def __init__(self, app_state=None):
+        self.app_state = app_state
+        self.authenticator = FyersAuthenticator(app_state=app_state)
         self.sheets_manager = GoogleSheetsManager(self)
         self.access_token = None
         self.fyers_ws = None
@@ -1498,22 +1329,26 @@ class VolumeSpikeDetector:
         
     def initialize(self):
         print("Initializing Volume Spike Detector...", flush=True)
-        
+
         print("Attempting authentication...", flush=True)
         if not self.authenticator.authenticate():
             print("Authentication failed!", flush=True)
             return False
-        
+
         print("Authentication successful!", flush=True)
         self.access_token = self.authenticator.access_token
-    
+
         try:
-            print("Getting Fyers model...", flush=True)
-            fyers = self.authenticator.get_fyers_model()
-            
+            # Use the fyers_model already created during authentication
+            # (avoids redundant token check that could trigger re-auth loop)
+            fyers_model = self.authenticator.fyers_model
+            if not fyers_model:
+                print("Error: fyers_model not available after authentication", flush=True)
+                return False
+
             print("Getting profile...", flush=True)
-            profile = fyers.get_profile()
-            
+            profile = fyers_model.get_profile()
+
             if profile['s'] == 'ok':
                 print(f"Connected! User: {profile['data']['name']}", flush=True)
                 return True
@@ -1651,6 +1486,41 @@ class VolumeSpikeDetector:
                 except:
                     pass
 
+    def get_summary(self):
+        """Generate a summary of the current monitoring session."""
+        uptime = time.time() - self.start_time
+        hours = int(uptime // 3600)
+        minutes = int((uptime % 3600) // 60)
+
+        # Top sectors by trade count
+        sorted_sectors = sorted(
+            dict(self.sector_counts).items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:5]
+
+        sector_text = "\n".join(
+            f"  {s}: {c} trades" for s, c in sorted_sectors
+        ) or "  No trades detected yet"
+
+        auth_status = "Authenticated" if self.authenticator.is_authenticated else "Not authenticated"
+
+        summary = f"""<b>Session Summary</b>
+
+<b>Uptime:</b> {hours}h {minutes}m
+<b>Auth:</b> {auth_status}
+<b>Total Ticks:</b> {self.total_ticks:,}
+<b>Large Trades Detected:</b> {self.individual_trades_detected}
+<b>Symbols Monitored:</b> {len(STOCK_SYMBOLS)}
+<b>Threshold:</b> Rs {INDIVIDUAL_TRADE_THRESHOLD/10000000:.1f} Cr
+
+<b>Top Sectors:</b>
+{sector_text}
+
+<b>Time:</b> {datetime.now(ZoneInfo("Asia/Kolkata")).strftime('%d-%m-%Y %H:%M:%S')} IST"""
+
+        return summary
+
 # =============================================================================
 # MAIN EXECUTION
 # =============================================================================
@@ -1667,9 +1537,7 @@ if __name__ == "__main__":
         print("Fyers Volume Spike Detector", flush=True)
         print("="*70, flush=True)
 
-        print("\nCommands available:", flush=True)
-        print("   Detector Bot: 'force' or 'restart'", flush=True)
-        print("\nSupervisor will check for commands every 10 seconds", flush=True)
+        print("\nAuth codes received via webhook", flush=True)
         print("="*70, flush=True)
 
         print("\nStarting supervisor loop...", flush=True)
