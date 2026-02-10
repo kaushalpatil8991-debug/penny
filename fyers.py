@@ -370,7 +370,7 @@ def save_fyers_token_to_json(access_token, timestamp=None, created_at=None):
         return False
 
 # Telegram Configuration - For Detector
-TELEGRAM_BOT_TOKEN = "8564259065:AAGM5clL_pOagSAEiNURB0ltu1E0yvdC-4Q"
+TELEGRAM_BOT_TOKEN = "8578552096:AAFPDOnSMPehwScsJoDTm_PRZU0bDGYsEpM"
 TELEGRAM_CHAT_ID = "8388919023"
 TELEGRAM_POLLING_INTERVAL = 5
 TELEGRAM_AUTH_TIMEOUT = 300
@@ -1685,4 +1685,5 @@ if __name__ == "__main__":
         traceback.print_exc()
         _stop_stream_once()
         sys.exit(1)
+
 
