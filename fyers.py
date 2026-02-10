@@ -117,7 +117,7 @@ def _inside_window_ist() -> bool:
     hhmm = now.strftime("%H:%M")
     return MARKET_START_TIME <= hhmm < MARKET_END_TIME
 
-def supervisor_loop(app_state=None):
+def supervisor_loop():
     """Simplified supervisor that manages the detector lifecycle"""
     print("Supervisor loop started", flush=True)
     detector = None
@@ -370,7 +370,7 @@ def save_fyers_token_to_json(access_token, timestamp=None, created_at=None):
         return False
 
 # Telegram Configuration - For Detector
-TELEGRAM_BOT_TOKEN = "8578552096:AAFPDOnSMPehwScsJoDTm_PRZU0bDGYsEpM"
+TELEGRAM_BOT_TOKEN = "8564259065:AAGM5clL_pOagSAEiNURB0ltu1E0yvdC-4Q"
 TELEGRAM_CHAT_ID = "8388919023"
 TELEGRAM_POLLING_INTERVAL = 5
 TELEGRAM_AUTH_TIMEOUT = 300
