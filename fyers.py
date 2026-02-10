@@ -108,11 +108,6 @@ def _stream_worker(stop_event: threading.Event):
 
 def _inside_window_ist() -> bool:
     """Check if current IST time is within market hours."""
-    # Check if force start flag is set
-    import builtins
-    if hasattr(builtins, 'FORCE_START') and builtins.FORCE_START:
-        return True  # Always return True when forced
-    
     now = datetime.now(ZoneInfo("Asia/Kolkata"))
     hhmm = now.strftime("%H:%M")
     return MARKET_START_TIME <= hhmm < MARKET_END_TIME
@@ -122,141 +117,49 @@ def supervisor_loop():
     print("Supervisor loop started", flush=True)
     detector = None
     last_auth_check = time.time()
-    last_command_check = time.time()
     AUTH_CHECK_INTERVAL = 3600
-    COMMAND_CHECK_INTERVAL = 3  # Check for commands every 10 seconds
-    
-    # Create telegram handler for checking commands
-    telegram = TelegramHandler()
-    
+
     while True:
         try:
             current_time = time.time()
-            
-            # Check for force/restart commands periodically
-            if current_time - last_command_check > COMMAND_CHECK_INTERVAL:
-                print("[SUPERVISOR] Checking for commands...", flush=True)
-                
-                # Check for force command
-                if telegram.check_for_force_command():
-                    print("[SUPERVISOR] Force command detected! Setting FORCE_START flag", flush=True)
-                    telegram.send_message("🚀 <b>Force Start Initiated</b>\n\n⏳ Bypassing market hours...\n📊 Starting detector immediately...")
-                    import builtins
-                    builtins.FORCE_START = True
-                
-                # Check for restart command
-                if telegram.check_for_restart_command():
-                    print("[SUPERVISOR] Restart command detected! Restarting detector only...", flush=True)
-                    
-                    # Send status message
-                    telegram.send_message("🔄 <b>Restarting Detector...</b>\n\n⏳ Stopping current detector process...")
-                    
-                    # Stop only the detector, not the summary scheduler
-                    _stop_stream_once()
-                    detector = None
-                    
-                    telegram.send_message("✅ Detector stopped\n⏳ Starting fresh detector instance...")
-                    
-                    time.sleep(2)
-                    
-                    # Create new detector instance
-                    try:
-                        detector = VolumeSpikeDetector()
-                        telegram.send_message("🔧 Detector instance created\n⏳ Initializing...")
-                        
-                        _start_stream_once()
-                        
-                        telegram.send_message("✅ <b>Detector Restarted Successfully!</b>\n\n📊 Status: Monitoring active\n⏰ Time: " + datetime.now().strftime('%H:%M:%S'))
-                        print("[SUPERVISOR] Detector restarted successfully", flush=True)
-                        
-                    except Exception as restart_error:
-                        error_msg = f"❌ <b>Restart Failed</b>\n\nError: {str(restart_error)}\n\nPlease try again or check logs."
-                        telegram.send_message(error_msg)
-                        print(f"[SUPERVISOR] Restart error: {restart_error}", flush=True)
-                    
-                    # Continue to next iteration
-                    last_command_check = current_time
-                    continue
-                
-                last_command_check = current_time
-            
+
             # Check if we're in market hours
             in_window = _inside_window_ist()
-            
+
             if SCHEDULING_ENABLED and not in_window:
                 if detector:
                     print("Outside market hours, stopping detector...", flush=True)
                     _stop_stream_once()
                     detector = None
-                # Don't spam logs, only print occasionally
                 if int(current_time) % 300 == 0:  # Every 5 minutes
-                    print("Waiting for market hours (or send 'force' command)...", flush=True)
+                    print("Waiting for market hours...", flush=True)
                 time.sleep(60)
                 continue
-            
-            # We should be running - start detector if not running
-            if not detector or not _running_flag:
+
+            # We should be running - start stream if not running
+            if not _running_flag:
                 print("Starting detector...", flush=True)
                 _stop_stream_once()
                 time.sleep(2)
-                
+
                 try:
-                    detector = VolumeSpikeDetector()
-                    print("Detector instance created, starting stream...", flush=True)
                     _start_stream_once()
                     print("Stream started successfully", flush=True)
-                    
-                    # Send connection status to user after successful start
-                    try:
-                        # Wait a moment for initialization to complete
-                        time.sleep(3)
-                        
-                        # Check if detector is actually running and authenticated
-                        if detector and hasattr(detector, 'authenticator') and detector.authenticator.is_authenticated:
-                            # Get user info if available
-                            user_name = "Unknown"
-                            try:
-                                if detector.authenticator.fyers_model:
-                                    profile = detector.authenticator.fyers_model.get_profile()
-                                    if profile.get('s') == 'ok':
-                                        user_name = profile['data']['name']
-                            except:
-                                pass
-                            
-                            connection_msg = f"""✅ <b>Detector Connected Successfully!</b>
-
-👤 <b>User:</b> {user_name}
-📊 <b>Status:</b> Monitoring Active
-🎯 <b>Symbols:</b> {len(STOCK_SYMBOLS)} stocks
-💰 <b>Threshold:</b> Rs {INDIVIDUAL_TRADE_THRESHOLD/10000000:.1f} Cr
-⏰ <b>Started:</b> {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}
-
-🔔 You will receive alerts for large volume spikes!"""
-                            
-                            telegram.send_message(connection_msg)
-                            print("Connection status sent to user", flush=True)
-                            
-                    except Exception as msg_error:
-                        print(f"Could not send connection message: {msg_error}", flush=True)
-                        
+                    detector = True
                 except Exception as start_error:
                     print(f"Error starting detector: {start_error}", flush=True)
-                    telegram.send_message(f"❌ <b>Detector Start Failed</b>\n\nError: {str(start_error)}\n\nWill retry in 30 seconds...")
+                    detector = None
                     time.sleep(30)
-                
-            # Periodic auth check (every hour)
+
+            # Periodic auth check — just restart the stream if it's been an hour
             if current_time - last_auth_check > AUTH_CHECK_INTERVAL:
-                print("Performing periodic auth check...", flush=True)
-                if detector and hasattr(detector, 'authenticator'):
-                    if not detector.authenticator.is_authenticated:
-                        print("Auth expired, will re-authenticate on next cycle", flush=True)
-                        _stop_stream_once()
-                        detector = None
+                print("Periodic auth check — restarting stream for fresh auth...", flush=True)
+                _stop_stream_once()
+                detector = None
                 last_auth_check = current_time
-            
-            # Sleep before next check
-            time.sleep(5)  # Check more frequently
-            
+
+            time.sleep(5)
+
         except Exception as e:
             print(f"Supervisor error: {e}", flush=True)
             import traceback
@@ -370,8 +273,8 @@ def save_fyers_token_to_json(access_token, timestamp=None, created_at=None):
         return False
 
 # Telegram Configuration - For Detector
-TELEGRAM_BOT_TOKEN = "8303548716:AAF2jXwncMuW8VvI3wl8l4RXObDgkDvCvfo"
-TELEGRAM_CHAT_ID = "5715256800"
+TELEGRAM_BOT_TOKEN = "8564259065:AAGM5clL_pOagSAEiNURB0ltu1E0yvdC-4Q"
+TELEGRAM_CHAT_ID = "8388919023"
 TELEGRAM_POLLING_INTERVAL = 5
 TELEGRAM_AUTH_TIMEOUT = 300
 
@@ -1007,10 +910,20 @@ class TelegramHandler:
         self.chat_id = TELEGRAM_CHAT_ID
         self.base_url = f"https://api.telegram.org/bot{self.bot_token}"
         self.last_update_id = 0
-        self.last_url_sent_time = 0  # Track when URL was last sent
-        self.url_send_count = 0  # Track how many times URL was sent in current session
-        self.current_auth_session_id = None  # Unique ID for current auth session
-        
+        self.last_url_sent_time = 0
+        self.url_send_count = 0
+        self.current_auth_session_id = None
+
+        # Flush old messages so we only see new ones
+        try:
+            resp = requests.get(f"{self.base_url}/getUpdates", params={"offset": -1, "timeout": 0}, timeout=10)
+            data = resp.json()
+            if data.get("ok") and data.get("result"):
+                self.last_update_id = data["result"][-1]["update_id"]
+                print(f"[TELEGRAM] Flushed old messages, starting from update_id: {self.last_update_id}", flush=True)
+        except Exception as e:
+            print(f"[TELEGRAM] Flush failed: {e}", flush=True)
+
     def send_message(self, message):
         """Send a message to Telegram"""
         try:
@@ -1032,9 +945,9 @@ class TelegramHandler:
             url = f"{self.base_url}/getUpdates"
             params = {
                 "offset": self.last_update_id + 1,
-                "timeout": 30
+                "timeout": 5
             }
-            response = requests.get(url, params=params, timeout=35)
+            response = requests.get(url, params=params, timeout=10)
             
             if response.status_code == 200:
                 data = response.json()
@@ -1047,7 +960,7 @@ class TelegramHandler:
                 else:
                     print(f"[TELEGRAM] Response OK but no results: {data}", flush=True)
             else:
-                print(f"[TELEGRAM] Bad response: {response.status_code}", flush=True)
+                print(f"[TELEGRAM] Bad response: {response.status_code} - {response.text}", flush=True)
             
             return []
         except Exception as e:
@@ -1122,53 +1035,6 @@ class TelegramHandler:
         self.current_auth_session_id = time.time()
         self.last_url_sent_time = 0
     
-    def check_for_restart_command(self):
-        """Check for restart command in Telegram messages"""
-        try:
-            print("Checking Telegram for restart command...", flush=True)
-            updates = self.get_updates()
-            
-            for update in updates:
-                if "message" in update and "text" in update["message"]:
-                    message_text = update["message"]["text"].strip()
-                    print(f"Received message: '{message_text}'", flush=True)
-                    
-                    # Check various forms of restart command (case insensitive)
-                    if message_text.lower() in ["restart", "restart!", "restart.", "restart bot", "restart system", "reboot"]:
-                        print(f"Restart command received: '{message_text}'", flush=True)
-                        self.send_message("Restart command received! Initiating restart...")
-                        return True
-            
-            return False
-        except Exception as e:
-            print(f"Error checking for restart command: {e}", flush=True)
-            return False
-
-    def check_for_force_command(self):
-        """Check for Force command in Telegram messages"""
-        try:
-            print("Checking Telegram for force command...", flush=True)
-            updates = self.get_updates()
-            print(f"Got {len(updates)} Telegram updates", flush=True)
-            
-            for update in updates:
-                if "message" in update and "text" in update["message"]:
-                    message_text = update["message"]["text"].strip()
-                    print(f"Received message: '{message_text}'", flush=True)
-                    
-                    # Check various forms of force command (case insensitive)
-                    if message_text.lower() in ["force", "start", "start now"]:
-                        print(f"Force command detected: '{message_text}'", flush=True)
-                        self.send_message("Force command received! Starting detector immediately, bypassing market hours.")
-                        return True
-            
-            print("No force command found in messages", flush=True)
-            return False
-        except Exception as e:
-            print(f"Error checking for Force command: {e}", flush=True)
-            import traceback
-            traceback.print_exc()
-            return False
 
 # =============================================================================
 # FYERS AUTHENTICATOR CLASS
@@ -1667,9 +1533,6 @@ if __name__ == "__main__":
         print("Fyers Volume Spike Detector", flush=True)
         print("="*70, flush=True)
 
-        print("\nCommands available:", flush=True)
-        print("   Detector Bot: 'force' or 'restart'", flush=True)
-        print("\nSupervisor will check for commands every 10 seconds", flush=True)
         print("="*70, flush=True)
 
         print("\nStarting supervisor loop...", flush=True)
@@ -1685,6 +1548,4 @@ if __name__ == "__main__":
         traceback.print_exc()
         _stop_stream_once()
         sys.exit(1)
-
-
 
