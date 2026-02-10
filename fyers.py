@@ -117,7 +117,7 @@ def _inside_window_ist() -> bool:
     hhmm = now.strftime("%H:%M")
     return MARKET_START_TIME <= hhmm < MARKET_END_TIME
 
-def supervisor_loop():
+def supervisor_loop(app_state=None):
     """Simplified supervisor that manages the detector lifecycle"""
     print("Supervisor loop started", flush=True)
     detector = None
