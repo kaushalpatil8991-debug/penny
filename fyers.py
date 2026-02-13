@@ -41,7 +41,7 @@ FYERS_TOTP_SECRET = "7JKB7FFBMZNQRYYV7PQ46L7XRUQLR6FV"
 FYERS_PIN = "8905"
 
 # Trading Configuration
-INDIVIDUAL_TRADE_THRESHOLD = 4200000  # Rs 42 Lakhs for individual trades
+INDIVIDUAL_TRADE_THRESHOLD = 5500000  # Rs 52 Lakhs for individual trades
 MIN_VOLUME_SPIKE = 1000  # Minimum volume spike to consider
 
 # Google Sheets Configuration
@@ -1548,5 +1548,6 @@ if __name__ == "__main__":
         traceback.print_exc()
         _stop_stream_once()
         sys.exit(1)
+
 
 
